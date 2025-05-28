@@ -1,0 +1,24 @@
+[
+  {
+    "user_id": 1,
+    "voat_id": "VOAT-001",
+    "email": "245122748012@mvsrec.edu.in",
+    "resume": null,
+    "appliedJobs": [],
+    "schedule": [],
+    "notifications": [],
+    "name": "Tanvi",
+    "password": "sweety@9",
+    "phone": "7385956398",
+    "gender": "Female",
+    "address": "Babucamp",
+    "skills": "React, JavaScript, TypeScript, Node.js",
+    "whatsapp": "7385956398",
+    "parent": {
+      "parentName": "Kavitha",
+      "parentPhone": "9908723872",
+      "parentRelation": "Mother",
+      "parentEmail": "berellitanvi@gmail.com"
+    }
+  }
+]
