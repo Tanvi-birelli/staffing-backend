@@ -5,16 +5,16 @@ const getProfile = (req, res) => {
   const users = loadJSON("users.json");
   const jobseekers = loadJSON("jobseekers.json");
 
-  // Find user and jobseeker by email
   const user = users.find(u => u.email === req.user.email);
   const jobseeker = jobseekers.find(j => j.email === req.user.email);
 
   if (!user || !jobseeker) return res.status(404).json({ error: "Profile not found" });
 
-  // Merge user and jobseeker data (user fields take precedence)
   const profile = {
     ...jobseeker,
-    ...user, // name, phone, etc. from user
+    ...user,
+    resume: jobseeker.resume || null, 
+    experience: jobseeker.experience || [], 
   };
 
   res.json(profile);
@@ -24,46 +24,35 @@ const getProfile = (req, res) => {
 
 // PUT /jobseeker/api/profile
 const updateProfile = (req, res) => {
-  // Load jobseekers data (assuming it contains all profile fields including name and parent)
-  let jobseekers = loadJSON("jobseekers.json"); // Use 'let' because we will modify the array
+  let jobseekers = loadJSON("jobseekers.json");
 
-  // Find the index of the jobseeker entry by email
-  const index = jobseekers.findIndex(j => j.email === req.user.email);
+  const jobseekerIndex = jobseekers.findIndex(j => j.email === req.user.email);
 
-  // If not found, return 404
-  if (index === -1) {
+  if (jobseekerIndex === -1) {
      console.warn(`Profile not found for update for email: ${req.user.email}`);
      return res.status(404).json({ error: "Profile not found" });
   }
 
-  // Get the existing jobseeker object
-  const existingJobseeker = jobseekers[index];
+  const existingJobseeker = jobseekers[jobseekerIndex];
 
-  // Create the updated jobseeker object
-  // Spread existing data, then overwrite with fields from req.body
-  // This will include the nested 'parent' object if sent by the frontend
   const updatedJobseeker = {
     ...existingJobseeker,
     ...req.body,
-    // IMPORTANT: Prevent overwriting sensitive fields like email, password, resume, appliedJobs if they are also sent in req.body by mistake
-    // If these fields should NOT be updated via this PUT endpoint, explicitly keep the existing values:
-    email: existingJobseeker.email,
-    // password: existingJobseeker.password, // Don't update password here - use a dedicated password change endpoint
-    // resume: existingJobseeker.resume, // Don't update resume here - use a dedicated upload endpoint
-    // appliedJobs: existingJobseeker.appliedJobs, // Don't update appliedJobs here - use apply/unapply endpoints
-    // user_id: existingJobseeker.user_id,
-    // voat_id: existingJobseeker.voat_id,
+    email: existingJobseeker.email, 
+    password: existingJobseeker.password, 
+    appliedJobs: existingJobseeker.appliedJobs, 
+    user_id: existingJobseeker.user_id, 
+    voat_id: existingJobseeker.voat_id, 
   };
 
+  if (req.body.resume !== undefined) {
+      updatedJobseeker.resume = req.body.resume;
+  }
 
-  // Replace the old entry with the updated one
-  jobseekers[index] = updatedJobseeker;
+  jobseekers[jobseekerIndex] = updatedJobseeker;
 
-  // Save the modified array back to the file
   saveJSON("jobseekers.json", jobseekers);
 
-  // Return success message and the updated profile data
-  // Exclude password from the response for security
   const { password, ...profileResponse } = updatedJobseeker;
 
   res.json({ message: "Profile updated successfully", profile: profileResponse });
@@ -106,51 +95,46 @@ const applyJob = (req, res) => {
 
 // GET /jobseeker/api/schedule
 const getSchedule = (req, res) => {
-  const jobseekers = loadJSON("jobseekers.json");
-  const user = jobseekers.find(j => j.email === req.user.email);
-  if (!user) return res.status(404).json({ error: "User not found" });
-
-  res.json(user.schedule || []);
-};
-
-// GET /jobseeker/api/dashboard
-const getDashboard = (req, res) => {
-  const jobseekers = loadJSON("jobseekers.json");
-  const user = jobseekers.find(j => j.email === req.user.email);
-  if (!user) return res.status(404).json({ error: "User not found" });
-
-  const jobs = loadJSON("jobs.json");
-  const appliedJobs = user.appliedJobs || [];
-
-  res.json({
-    appliedCount: appliedJobs.length,
-    scheduled: user.schedule?.length || 0,
-    notifications: user.notifications?.length || 0,
-  });
+  const schedules = loadJSON("schedules.json");
+  const userSchedules = schedules.filter(s => s.jobseekerEmail === req.user.email);
+  res.json(userSchedules || []);
 };
 
 // GET /jobseeker/api/notifications
 const getNotifications = (req, res) => {
-  const jobseekers = loadJSON("jobseekers.json");
-  const user = jobseekers.find(j => j.email === req.user.email);
-  if (!user) return res.status(404).json({ error: "User not found" });
-
-  res.json(user.notifications || []);
+  const notifications = loadJSON("notifications.json");
+  const userNotifications = notifications.filter(n => n.jobseekerEmail === req.user.email);
+  res.json(userNotifications || []);
 };
 
 // PATCH /jobseeker/api/notifications/:id
 const markNotificationRead = (req, res) => {
-  const jobseekers = loadJSON("jobseekers.json");
-  const index = jobseekers.findIndex(j => j.email === req.user.email);
-  if (index === -1) return res.status(404).json({ error: "User not found" });
+  const notifications = loadJSON("notifications.json");
+  const notification = notifications.find(n => n.id === parseInt(req.params.id) && n.jobseekerEmail === req.user.email);
 
-  const notifs = jobseekers[index].notifications || [];
-  const notif = notifs.find(n => n.id === req.params.id);
-  if (!notif) return res.status(404).json({ error: "Notification not found" });
+  if (!notification) return res.status(404).json({ error: "Notification not found or does not belong to user" });
 
-  notif.read = true;
-  saveJSON("jobseekers.json", jobseekers);
+  notification.read = true;
+
+  saveJSON("notifications.json", notifications);
+
   res.json({ message: "Notification marked as read" });
+};
+
+// PATCH /jobseeker/api/notifications/mark-all-read
+const markAllNotificationsRead = (req, res) => {
+  const notifications = loadJSON("notifications.json");
+  const updatedNotifications = notifications.map(notif => {
+    if (notif.jobseekerEmail === req.user.email) {
+      return { ...notif, read: true };
+    } else {
+      return notif;
+    }
+  });
+
+  saveJSON("notifications.json", updatedNotifications);
+
+  res.json({ message: "All notifications marked as read" });
 };
 
 module.exports = {
@@ -160,7 +144,7 @@ module.exports = {
   getAppliedJobs,
   applyJob,
   getSchedule,
-  getDashboard,
   getNotifications,
-  markNotificationRead
+  markNotificationRead,
+  markAllNotificationsRead
 }; 

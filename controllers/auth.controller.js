@@ -3,7 +3,7 @@ const validator = require("validator");
 const jwt = require("jsonwebtoken");
 const { v4: uuidv4 } = require("uuid");
 const { loadUsers, saveUsers, updateIds, loadJSON, saveJSON } = require("../utils/fileHelpers");
-const { generateOTP, sendOTP, sendPasswordResetEmail } = require("../utils/otpHelpers");
+const { generateOTP, sendOTP, sendPasswordResetEmail, generateToken, sendEmailVerificationEmail } = require("../utils/otpHelpers");
 const validatePassword = require("../utils/passwordHelpers");
 const crypto = require('crypto'); // Import crypto for token generation
 
@@ -254,7 +254,7 @@ const verifyOTP = async (req, res) => {
     res.json({
       message: "Login successful",
       token: jwtToken,
-      data: { email: user.email, role: user.role },
+      data: { email: user.email, role: user.role, name: user.name },
     });
   } else {
     res.status(400).json({ error: "Invalid OTP verification type" });
@@ -356,6 +356,164 @@ const resetPassword = async (req, res) => {
   }
 };
 
+// Verify Email Change Controller
+const verifyEmail = (req, res) => {
+  const { token } = req.query;
+
+  if (!token) {
+    return res.status(400).json({ error: "Verification token is required." });
+  }
+
+  let users = loadUsers();
+
+  // Find user by verification token
+  const user = users.find(u => u.emailVerificationToken === token);
+
+  if (!user) {
+    // Maybe redirect to an error page in a real app
+    return res.status(400).json({ error: "Invalid or expired verification token." });
+  }
+
+  // Check if the token has expired
+  if (user.emailTokenExpires && user.emailTokenExpires < Date.now()) {
+     // Clean up expired token fields
+    delete user.pendingEmail;
+    delete user.emailVerificationToken;
+    delete user.emailTokenExpires;
+    saveUsers(users);
+     // Maybe redirect to an error page or a resend verification page
+    return res.status(400).json({ error: "Verification token has expired. Please request a new email change." });
+  }
+
+  // Token is valid - update email
+  if (user.pendingEmail) {
+      user.email = user.pendingEmail;
+      user.verified = true; // Mark as verified if not already
+
+      // Clean up temporary fields
+      delete user.pendingEmail;
+      delete user.emailVerificationToken;
+      delete user.emailTokenExpires;
+
+      saveUsers(users);
+
+      // In a real app, you might redirect the user to a success page
+      res.json({ message: "Email verified successfully!" });
+  } else {
+      // Should not happen if pendingEmail was stored correctly
+      return res.status(500).json({ error: "Verification failed: Pending email not found." });
+  }
+};
+
+// Secure Password Change Controller
+const changePassword = async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  const userEmail = req.user.email; // Email from authenticated JWT payload
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: "Current password and new password are required." });
+  }
+
+  let users = loadUsers();
+  const user = users.find(u => u.email === userEmail);
+
+  if (!user) {
+    // This case should ideally not happen if authenticateJWT works correctly
+    console.error(`Authenticated user email not found in users.json: ${userEmail}`);
+    return res.status(404).json({ error: "Authenticated user not found." });
+  }
+
+  // Verify current password
+  const isMatch = await bcrypt.compare(currentPassword, user.password);
+  if (!isMatch) {
+    return res.status(401).json({ error: "Incorrect current password." });
+  }
+
+  // Validate new password
+  if (!validatePassword(newPassword)) {
+    return res.status(400).json({
+      error:
+        "New password must be at least 6 characters, include uppercase & number",
+    });
+  }
+
+  try {
+    // Hash the new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update user's password
+    user.password = hashedPassword;
+
+    saveUsers(users); // Save the updated users array
+
+    console.log(`Password successfully changed for email: ${userEmail}`);
+
+    res.json({ message: "Password changed successfully." });
+
+  } catch (error) {
+    console.error(`Error changing password for ${userEmail}:`, error);
+    res.status(500).json({ message: "An error occurred while changing your password." });
+  }
+};
+
+// Request Email Change Controller
+const requestEmailChange = async (req, res) => {
+  const { newEmail } = req.body;
+  const userEmail = req.user.email; // Email from authenticated JWT payload
+
+  if (!newEmail) {
+    return res.status(400).json({ error: "New email is required." });
+  }
+
+  if (!validator.isEmail(newEmail)) {
+    return res.status(400).json({ error: "Invalid new email format." });
+  }
+
+  let users = loadUsers();
+  const user = users.find(u => u.email === userEmail);
+
+   if (!user) {
+    // This case should ideally not happen if authenticateJWT works correctly
+    console.error(`Authenticated user email not found in users.json for email change request: ${userEmail}`);
+    return res.status(404).json({ error: "Authenticated user not found." });
+  }
+
+  // Check if the new email is the same as the current email
+  if (newEmail === user.email) {
+      return res.status(400).json({ message: "New email is the same as the current email." });
+  }
+
+  // Check if the new email is already in use by another user
+  if (users.some(u => u.email === newEmail || (u.pendingEmail === newEmail && u.emailVerificationToken && u.emailTokenExpires > Date.now()))) {
+      return res.status(400).json({ error: "Email is already in use." });
+  }
+
+  try {
+    // Generate a verification token
+    const verificationToken = generateToken();
+    const verificationLink = `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`;
+
+    // Store pending email change details in the user object
+    user.pendingEmail = newEmail;
+    user.emailVerificationToken = verificationToken;
+    user.emailTokenExpires = Date.now() + 3600000; // Token valid for 1 hour
+
+    saveUsers(users); // Save the updated users array
+
+    // Send the email using the helper function
+    await sendEmailVerificationEmail(newEmail, verificationLink);
+
+    console.log(`Email verification initiated for ${userEmail} to ${newEmail}.`);
+
+    res.json({ message: "Verification email sent to your new address." });
+
+  } catch (error) {
+    console.error(`Error requesting email change for ${userEmail}:`, error);
+    // Inform the user that the email could not be sent, but the request was processed.
+    res.status(500).json({ message: "Failed to send verification email. Please try again later." });
+  }
+};
+
 // Keep tempUsers in this file for now, or consider a more robust temporary storage
 // Need padNumber function for verifyOTP signup case - assuming it's a helper
 const padNumber = (num, length = 3) => String(num).padStart(length, "0");
@@ -367,5 +525,8 @@ module.exports = {
     verifyOTP,
     requestPasswordReset,
     resetPassword,
+    verifyEmail,
+    changePassword,
+    requestEmailChange,
     tempUsers // Export tempUsers if needed elsewhere, otherwise keep internal
 }; 

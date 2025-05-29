@@ -1,5 +1,15 @@
 const nodemailer = require("nodemailer");
 
+// Generate OTP or token
+const generateToken = () => {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let token = '';
+  for (let i = 0; i < 30; i++) {
+    token += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return token;
+};
+
 // Generate OTP
 const generateOTP = () =>
   Math.floor(100000 + Math.random() * 900000).toString();
@@ -65,9 +75,42 @@ const sendPasswordResetEmail = async (toEmail, resetLink) => {
   }
 };
 
+// Send Email Verification Email
+const sendEmailVerificationEmail = async (toEmail, verificationLink) => {
+  console.log('Attempting to send email verification email to:', toEmail);
+  console.log('Using user:', process.env.GMAIL_USER);
+
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      user: process.env.GMAIL_USER,
+      pass: process.env.GMAIL_APP_PASS,
+    },
+  });
+
+  const emailSubject = 'Verify Your Email Address';
+  const emailText = `Please click on the following link to verify your new email address:\n${verificationLink}\n\nIf you did not request this email change, please ignore this email.`;
+
+  try {
+    await transporter.sendMail({
+      from: process.env.GMAIL_USER,
+      to: toEmail,
+      subject: emailSubject,
+      text: emailText,
+    });
+    console.log('Email verification email sent successfully to', toEmail);
+
+  } catch (error) {
+      console.error('Error sending email verification email to', toEmail, ':', error);
+      throw error; // Re-throw the error
+  }
+};
+
 module.exports = {
     generateOTP,
     sendOTP,
     sendPasswordResetEmail,
+    generateToken,
+    sendEmailVerificationEmail,
     // transporter is no longer exported
 }; 

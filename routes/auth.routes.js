@@ -3,6 +3,7 @@ const router = express.Router();
 const authController = require("../controllers/auth.controller");
 const { upload } = require("../utils/multerConfig");
 const { signInOtpLimiter, LoginOtpLimiter } = require("../utils/rateLimiters");
+const authenticateJWT = require("../middleware/auth.middleware");
 
 // Signup Route
 router.post(
@@ -26,5 +27,14 @@ router.post("/forgot-password", authController.requestPasswordReset);
 
 // Reset Password
 router.post("/reset-password", authController.resetPassword);
+
+// Verify Email Change
+router.get("/verify-email", authController.verifyEmail);
+
+// Secure Password Change (Requires authentication)
+router.put("/change-password", authenticateJWT, authController.changePassword);
+
+// Request Email Change (Requires authentication)
+router.post("/request-email-change", authenticateJWT, authController.requestEmailChange);
 
 module.exports = router;

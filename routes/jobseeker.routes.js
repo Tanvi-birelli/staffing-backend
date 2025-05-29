@@ -12,8 +12,8 @@ router.get("/jobseeker/api/jobs", ...jobseekerAuth, jobseekerController.getJobs)
 router.get("/jobseeker/api/jobs/applied", ...jobseekerAuth, jobseekerController.getAppliedJobs);
 router.post("/jobseeker/api/jobs/apply", ...jobseekerAuth, jobseekerController.applyJob);
 router.get("/jobseeker/api/schedule", ...jobseekerAuth, jobseekerController.getSchedule);
-router.get("/jobseeker/api/dashboard", ...jobseekerAuth, jobseekerController.getDashboard);
 router.get("/jobseeker/api/notifications", ...jobseekerAuth, jobseekerController.getNotifications);
 router.patch("/jobseeker/api/notifications/:id", ...jobseekerAuth, jobseekerController.markNotificationRead);
+router.patch("/jobseeker/api/notifications/mark-all-read", ...jobseekerAuth, jobseekerController.markAllNotificationsRead);
 
 module.exports = router; 
