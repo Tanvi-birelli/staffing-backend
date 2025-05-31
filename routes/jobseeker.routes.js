@@ -8,9 +8,6 @@ const jobseekerAuth = [authenticateJWT, authorize(["jobseeker"])]
 
 router.get("/jobseeker/api/profile", ...jobseekerAuth, jobseekerController.getProfile);
 router.put("/jobseeker/api/profile", ...jobseekerAuth, jobseekerController.updateProfile);
-router.get("/jobseeker/api/jobs", ...jobseekerAuth, jobseekerController.getJobs);
-router.get("/jobseeker/api/jobs/applied", ...jobseekerAuth, jobseekerController.getAppliedJobs);
-router.post("/jobseeker/api/jobs/apply", ...jobseekerAuth, jobseekerController.applyJob);
 router.get("/jobseeker/api/schedule", ...jobseekerAuth, jobseekerController.getSchedule);
 router.get("/jobseeker/api/notifications", ...jobseekerAuth, jobseekerController.getNotifications);
 router.patch("/jobseeker/api/notifications/:id", ...jobseekerAuth, jobseekerController.markNotificationRead);

@@ -103,7 +103,19 @@ const getSchedule = (req, res) => {
 // GET /jobseeker/api/notifications
 const getNotifications = (req, res) => {
   const notifications = loadJSON("notifications.json");
-  const userNotifications = notifications.filter(n => n.jobseekerEmail === req.user.email);
+  const { date } = req.query; // Get the date query parameter
+
+  let userNotifications = notifications.filter(n => n.email === req.user.email && n.role === 'jobseeker'); // Filter by jobseeker email and role
+
+  // If a date is provided, filter by date
+  if (date) {
+    userNotifications = userNotifications.filter(notif => {
+      // Assuming notification objects have a 'createdAt' timestamp
+      const notificationDate = new Date(notif.createdAt).toISOString().split('T')[0];
+      return notificationDate === date;
+    });
+  }
+
   res.json(userNotifications || []);
 };
 
@@ -140,9 +152,6 @@ const markAllNotificationsRead = (req, res) => {
 module.exports = {
   getProfile,
   updateProfile,
-  getJobs,
-  getAppliedJobs,
-  applyJob,
   getSchedule,
   getNotifications,
   markNotificationRead,

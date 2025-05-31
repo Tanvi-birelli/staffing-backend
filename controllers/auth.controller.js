@@ -24,10 +24,11 @@ const signup = async (req, res) => {
   if (role === "jobseeker" && !req.file) {
     return res.status(400).json({ error: "Resume required for jobseekers" });
   }
-  if (!validatePassword(password)) {
+  const passwordErrors = validatePassword(password);
+  if (passwordErrors.length > 0) {
     return res.status(400).json({
-      error:
-        "Password must be at least 6 characters, include uppercase & number",
+      error: "Password does not meet the requirements:",
+      details: passwordErrors
     });
   }
 
@@ -145,6 +146,8 @@ const requestLoginOTP = async (req, res) => {
 const verifyOTP = async (req, res) => {
   const { email, otp, tempToken, type } = req.body;
 
+  // End of temporary bypass
+
   if (!validator.isEmail(email)) {
     return res.status(400).json({ error: "Invalid email" });
   }
@@ -203,6 +206,7 @@ const verifyOTP = async (req, res) => {
       jobseekers.push({
         user_id: userId,
         voat_id: voatId,
+        email: tempUser.email,
         resume: tempUser.file,
       });
       saveJSON("jobseekers.json", jobseekers);
@@ -211,6 +215,7 @@ const verifyOTP = async (req, res) => {
       hrs.push({
         user_id: userId,
         voat_id: voatId,
+        email: tempUser.email,
       });
       saveJSON("hrs.json", hrs);
     }

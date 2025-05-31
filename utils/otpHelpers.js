@@ -39,6 +39,8 @@ const sendOTP = async (email, code) => {
 
   } catch (error) {
       console.error('Error sending OTP email to', email, ':', error);
+      // Log the full error object for inspection
+      console.error('Full email sending error object:', JSON.stringify(error, null, 2));
       throw error; // Re-throw the error
   }
 };
@@ -102,6 +104,8 @@ const sendEmailVerificationEmail = async (toEmail, verificationLink) => {
 
   } catch (error) {
       console.error('Error sending email verification email to', toEmail, ':', error);
+      // Log the full error object for inspection
+      console.error('Full email sending error object:', JSON.stringify(error, null, 2));
       throw error; // Re-throw the error
   }
 };
