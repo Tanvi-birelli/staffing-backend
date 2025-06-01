@@ -31,6 +31,9 @@ router.post("/reset-password", authController.resetPassword);
 // Verify Email Change
 router.get("/verify-email", authController.verifyEmail);
 
+// Email Change Verification
+router.get("/verify-email-change", authController.verifyEmailChange);
+
 // Secure Password Change (Requires authentication)
 router.put("/change-password", authenticateJWT, authController.changePassword);
 

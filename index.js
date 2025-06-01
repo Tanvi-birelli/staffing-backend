@@ -7,7 +7,7 @@ const corsOptions = {
 const dotenv = require("dotenv");
 const path = require("path");
 const { signInOtpLimiter, LoginOtpLimiter } = require("./utils/rateLimiters.js");
-const { padNumber, getNextIds, updateIds, loadUsers, saveUsers, loadContacts, saveContacts, loadAnnouncements, saveAnnouncements, loadJSON, saveJSON } = require("./utils/fileHelpers.js");
+// const { padNumber, getNextIds, updateIds, loadUsers, saveUsers, loadContacts, saveContacts, loadAnnouncements, saveAnnouncements, loadJSON, saveJSON } = require("./utils/fileHelpers.js");
 const { generateOTP, sendOTP } = require("./utils/otpHelpers.js");
 const validatePassword = require("./utils/passwordHelpers.js");
 const { upload, imageUpload } = require("./utils/multerConfig.js");
@@ -19,11 +19,15 @@ const announcementRoutes = require("./routes/announcement.routes.js");
 const jobseekerRoutes = require("./routes/jobseeker.routes.js");
 const adminRoutes = require("./routes/admin.routes.js");
 const hrRoutes = require("./routes/hr.routes.js");
+const { testDbConnection } = require("./config/db.js");
 
 dotenv.config();
+//console.log('DB_PASSWORD from .env:', process.env.DB_PASSWORD); 
 // console.log('GMAIL_USER:', process.env.GMAIL_USER);
 // console.log('GMAIL_APP_PASS:', process.env.GMAIL_APP_PASS);
 require("./config/env.js");
+
+testDbConnection();
 
 const app = express();
 const PORT = process.env.PORT|| 3001;

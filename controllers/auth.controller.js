@@ -6,8 +6,10 @@ const { loadUsers, saveUsers, updateIds, loadJSON, saveJSON } = require("../util
 const { generateOTP, sendOTP, sendPasswordResetEmail, generateToken, sendEmailVerificationEmail } = require("../utils/otpHelpers");
 const validatePassword = require("../utils/passwordHelpers");
 const crypto = require('crypto'); // Import crypto for token generation
+const { findUserByEmail, createUser, updateUser, findUserByResetToken, findUserByVerificationToken, createPendingSignup, findPendingSignupByEmail, updatePendingSignup, deletePendingSignup, findPendingSignupByToken } = require("../utils/dbHelpers");
+const { pool } = require("../utils/dbHelpers");
 
-const tempUsers = {}; // This might need a more persistent solution later
+// const tempUsers = {}; // This will be replaced by pending_signups table
 
 // Signup Controller
 const signup = async (req, res) => {
@@ -36,37 +38,61 @@ const signup = async (req, res) => {
     return res.status(400).json({ error: "Invalid role" });
   }
 
-  let users = loadUsers();
-  if (users.find((u) => u.email === email)) {
+  const existingUser = await findUserByEmail(email);
+  if (existingUser) {
     return res.status(400).json({ error: "Account already exists" });
+  }
+
+  let pendingSignup = await findPendingSignupByEmail(email);
+  const now = Date.now();
+  const OTP_COOLDOWN = 30 * 1000; // 30 seconds
+  const SIGNUP_BLOCK_DURATION = 5 * 60 * 1000; // 5 minutes
+
+  if (pendingSignup) {
+    // Check if currently blocked for signup
+    if (pendingSignup.blockExpires && pendingSignup.blockExpires > now) {
+      const remainingMillis = pendingSignup.blockExpires - now;
+      const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
+      return res.status(429).json({ error: `Too many signup attempts. Please try again in ${remainingMinutes} minute(s).` });
+    }
+    // Check OTP resend cooldown
+    if (pendingSignup.lastOtpSent && (now - pendingSignup.lastOtpSent) < OTP_COOLDOWN) {
+      const remainingSeconds = Math.ceil((OTP_COOLDOWN - (now - pendingSignup.lastOtpSent)) / 1000);
+      console.log(`Debug: Cooldown active. Remaining seconds: ${remainingSeconds}`); // Debugging line
+      return res.status(429).json({ error: `Please wait ${remainingSeconds} second(s) before requesting another OTP.` });
+    }
   }
 
   const otp = generateOTP();
   const tempToken = uuidv4();
-  const now = Date.now();
+  const otpExpires = now + 5 * 60 * 1000; // OTP valid for 5 minutes
 
-  tempUsers[tempToken] = {
+  const signupData = {
     name,
     email,
     hashedPassword: await bcrypt.hash(password, 10),
-    file,
+    resume_filepath: file,
     role,
-    otpData: {
-      code: otp,
-      expiresAt: now + 5 * 60 * 1000,
-      attempts: 0,
-      lastSent: now,
-    },
+    otpCode: otp,
+    otpExpires: otpExpires,
+    lastOtpSent: now,
+    otpAttempts: 0,
+    blockExpires: null // Reset block for new attempt
   };
 
   try {
+    if (pendingSignup) {
+      await updatePendingSignup(pendingSignup.id, { tempToken, ...signupData }); // Update existing pending signup with new tempToken
+    } else {
+      await createPendingSignup({ tempToken, ...signupData }); // Create new pending signup
+    }
+    console.log("Debug: Sending OTP."); // Debugging line
     await sendOTP(email, otp);
+    res.json({ message: "OTP sent", tempToken });
   } catch (error) {
-    console.error("Failed to send OTP:", error);
-    return res.status(500).json({ error: "Failed to send OTP" });
+    console.error("Failed to send OTP or save pending signup:", error);
+    return res.status(500).json({ error: "Failed to send OTP or process signup" });
   }
-
-  res.json({ message: "OTP sent", tempToken });
 };
 
 // Login with Password Controller
@@ -77,19 +103,50 @@ const loginPassword = async (req, res) => {
     return res.status(400).json({ error: "Invalid email" });
   }
 
-  let users = loadUsers();
-  const user = users.find((u) => u.email === email);
+  const user = await findUserByEmail(email);
 
   if (!user) return res.status(400).json({ error: "Account not found" });
+
+  const now = Date.now();
+  const GLOBAL_LOGIN_ATTEMPTS_LIMIT = 5;
+  const ACCOUNT_BLOCK_DURATION = 5 * 60 * 1000; // 5 minutes
+
+  if (user.lockoutExpires && user.lockoutExpires > now) {
+      const remainingMillis = user.lockoutExpires - now;
+      const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
+      return res.status(429).json({ error: `Account temporarily blocked. Please try again in ${remainingMinutes} minute(s).` });
+  }
+
   if (!user.verified)
     return res.status(400).json({ error: "Account not verified" });
 
   if (!(await bcrypt.compare(password, user.password))) {
-    return res.status(400).json({ error: "Incorrect password" });
+    let updates = {};
+    const newLoginAttempts = (user.loginAttempts || 0) + 1;
+    updates.loginAttempts = newLoginAttempts;
+    updates.lastFailedLoginAttempt = now;
+
+    let errorMessage = "Incorrect password.";
+    let attemptsLeft = GLOBAL_LOGIN_ATTEMPTS_LIMIT - newLoginAttempts;
+
+    if (newLoginAttempts >= GLOBAL_LOGIN_ATTEMPTS_LIMIT) {
+      updates.lockoutExpires = now + ACCOUNT_BLOCK_DURATION;
+      const blockDurationMinutes = Math.ceil(ACCOUNT_BLOCK_DURATION / (60 * 1000));
+      errorMessage = `Too many incorrect password attempts (${GLOBAL_LOGIN_ATTEMPTS_LIMIT}). Account temporarily blocked. Please try again in ${blockDurationMinutes} minute(s).`;
+      attemptsLeft = 0; // No attempts left
+    } else {
+      errorMessage += ` ${attemptsLeft} attempts left.`;
+    }
+
+    await updateUser(user.id, updates);
+    return res.status(400).json({ error: errorMessage, attemptsLeft: attemptsLeft });
   }
 
+  // Successful password login - reset all login-related counters
+  await updateUser(user.id, { loginAttempts: 0, otp: null, otpExpires: null, otpAttempts: 0, lastFailedLoginAttempt: null, lockoutExpires: null, lastOtpSent: null });
+
   const jwtToken = jwt.sign(
-    { email: user.email, role: user.role },
+    { id: user.id, email: user.email, role: user.role },
     process.env.JWT_SECRET,
     { expiresIn: "1h" }
   );
@@ -97,7 +154,7 @@ const loginPassword = async (req, res) => {
   res.json({
     message: "Logged in Successfully",
     token: jwtToken,
-    data: { email: user.email, role: user.role, name: user.name },
+    data: { email: user.email, role: user.role, name: user.username, id: user.id },
   });
 
 };
@@ -110,34 +167,45 @@ const requestLoginOTP = async (req, res) => {
     return res.status(400).json({ error: "Invalid email" });
   }
 
-  let users = loadUsers();
-  const user = users.find((u) => u.email === email);
+  const user = await findUserByEmail(email);
 
   if (!user) return res.status(400).json({ error: "Account not found" });
+
+  const now = Date.now();
+  const OTP_COOLDOWN = 30 * 1000; // 30 seconds
+  const ACCOUNT_BLOCK_DURATION = 5 * 60 * 1000; // 5 minutes
+
+  if (user.lockoutExpires && user.lockoutExpires > now) {
+    const remainingMillis = user.lockoutExpires - now;
+    const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
+    return res.status(429).json({ error: `Account temporarily blocked. Please try again in ${remainingMinutes} minute(s).` });
+  }
+
   if (!user.verified)
     return res.status(400).json({ error: "Account not verified" });
 
-  if (user.loginAttempts >= 5) {
-    return res.status(429).json({ error: "Account temporarily blocked" });
+  if (user.lastOtpSent && (now - user.lastOtpSent) < OTP_COOLDOWN) {
+    const remainingSeconds = Math.ceil((OTP_COOLDOWN - (now - user.lastOtpSent)) / 1000);
+    return res.status(429).json({ error: `Please wait ${remainingSeconds} second(s) before requesting another OTP.` });
   }
 
-  if (user.otp && user.otpExpires > Date.now()) {
-    return res.status(400).json({ error: "OTP already sent" });
+  // Clear existing OTP attempts if a new request comes after cooldown and no current lockout
+  if (user.otpAttempts > 0 || user.loginAttempts > 0) {
+    await updateUser(user.id, { otpAttempts: 0, loginAttempts: 0, lastFailedLoginAttempt: null });
   }
 
   const otp = generateOTP();
-  user.otp = otp;
-  user.otpExpires = Date.now() + 5 * 60 * 1000;
-  saveUsers(users);
+  const otpExpires = now + 5 * 60 * 1000;
 
   try {
+    await updateUser(user.id, { otp: otp, otpExpires: otpExpires, lastOtpSent: now });
+    console.log(`Debug: requestLoginOTP - User ID: ${user.id}, OTP set: ${otp}, OTP Expires: ${new Date(otpExpires).toLocaleString()}, Current Time: ${new Date(now).toLocaleString()}`);
     await sendOTP(email, otp);
-    res.json({ message: "OTP sent", expires: user.otpExpires });
+    res.json({ message: "OTP sent", expires: otpExpires });
   } catch (error) {
     console.error("OTP Send Error:", error);
-    delete user.otp;
-    delete user.otpExpires;
-    saveUsers(users);
+    // If sending fails, clear the OTP data and mark last sent for cooldown but don't block
+    await updateUser(user.id, { otp: null, otpExpires: null, lastOtpSent: now }); 
     res.status(500).json({ error: "Failed to send OTP" });
   }
 };
@@ -145,8 +213,6 @@ const requestLoginOTP = async (req, res) => {
 // Verify OTP Controller (Signup & Login)
 const verifyOTP = async (req, res) => {
   const { email, otp, tempToken, type } = req.body;
-
-  // End of temporary bypass
 
   if (!validator.isEmail(email)) {
     return res.status(400).json({ error: "Invalid email" });
@@ -158,111 +224,157 @@ const verifyOTP = async (req, res) => {
 
   if (type === "signup") {
     // Verify signup OTP
-    if (!tempToken || !tempUsers[tempToken]) {
-      return res.status(400).json({ error: "Invalid or expired token" });
+    if (!tempToken) {
+      return res.status(400).json({ error: "Invalid or missing token" });
     }
 
-    const tempUser = tempUsers[tempToken];
-    if (tempUser.email !== email) {
-      return res.status(400).json({ error: "Email mismatch" });
+    const pendingSignup = await findPendingSignupByToken(tempToken);
+
+    if (!pendingSignup || pendingSignup.email !== email) {
+      return res.status(400).json({ error: "Invalid or expired token, or email mismatch" });
     }
 
     const now = Date.now();
+    const SIGNUP_OTP_ATTEMPTS_LIMIT = 3;
+    const SIGNUP_BLOCK_DURATION = 5 * 60 * 1000; // 5 minutes
 
-    if (tempUser.otpData.expiresAt < now) {
-      delete tempUsers[tempToken];
+    if (pendingSignup.blockExpires && pendingSignup.blockExpires > now) {
+      const remainingMillis = pendingSignup.blockExpires - now;
+      const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
+      return res.status(429).json({ error: `Too many signup attempts. Please try again in ${remainingMinutes} minute(s).` });
+    }
+
+    if (pendingSignup.otpExpires < now) {
+      await deletePendingSignup(pendingSignup.id);
       return res.status(400).json({ error: "OTP expired" });
     }
 
-    if (tempUser.otpData.code !== otp) {
-      tempUser.otpData.attempts++;
-      if (tempUser.otpData.attempts >= 5) {
-        delete tempUsers[tempToken];
-        return res.status(429).json({ error: "Too many failed attempts" });
+    if (pendingSignup.otpCode !== otp) {
+      const newAttempts = (pendingSignup.otpAttempts || 0) + 1;
+      let updates = { otpAttempts: newAttempts };
+      let errorMessage = "Incorrect OTP.";
+      let attemptsLeft = SIGNUP_OTP_ATTEMPTS_LIMIT - newAttempts;
+
+      if (newAttempts >= SIGNUP_OTP_ATTEMPTS_LIMIT) {
+        updates.blockExpires = now + SIGNUP_BLOCK_DURATION;
+        const blockDurationMinutes = Math.ceil(SIGNUP_BLOCK_DURATION / (60 * 1000));
+        errorMessage = `Too many incorrect OTP attempts (${SIGNUP_OTP_ATTEMPTS_LIMIT}). Account temporarily blocked for signup. Please try again in ${blockDurationMinutes} minute(s).`;
+        attemptsLeft = 0; // No attempts left
+      } else {
+        errorMessage += ` ${attemptsLeft} attempts left.`;
       }
-      return res.status(400).json({ error: "Incorrect OTP" });
+
+      await updatePendingSignup(pendingSignup.id, updates);
+      return res.status(400).json({ error: errorMessage, attemptsLeft: attemptsLeft });
     }
-    // Generate IDs
-    const userId = updateIds("userId");
-    const voatId = `VOAT-${padNumber(updateIds("voatId"))}`;
+
     // OTP correct - add user to permanent store
-    let users = loadUsers();
-    users.push({
-      user_id: userId,
-      voat_id: voatId,
-      name: tempUser.name,
-      email: tempUser.email,
-      password: tempUser.hashedPassword,
-      resume: tempUser.file,
-      role: tempUser.role,
-      verified: true,
-      //loginAttempts: 0,
-      created_at: new Date().toISOString(),
-    });
-    saveUsers(users);
+    try {
+      // Generate VOAT ID
+      const allUsers = await findUserByEmail(null); // Get all users to find next available VOAT ID suffix
+      let nextVoatIdSuffix = 0;
+      if (allUsers && allUsers.length > 0) {
+          const voatIds = allUsers.map(user => user.voat_id).filter(Boolean).map(voatId => parseInt(voatId.split('-')[1]));
+          nextVoatIdSuffix = voatIds.length > 0 ? Math.max(...voatIds) + 1 : 1;
+      } else {
+          nextVoatIdSuffix = 1;
+      }
+      const voatId = `VOAT-${String(nextVoatIdSuffix).padStart(3, '0')}`;
 
-    if (tempUser.role === "jobseeker") {
-      const jobseekers = loadJSON("jobseekers.json");
-      jobseekers.push({
-        user_id: userId,
-        voat_id: voatId,
-        email: tempUser.email,
-        resume: tempUser.file,
+      await createUser({
+        username: pendingSignup.name,
+        email: pendingSignup.email,
+        hashedPassword: pendingSignup.hashedPassword,
+        role: pendingSignup.role,
+        voatId: voatId,
+        verified: true,
+        resume_filepath: pendingSignup.resume_filepath
       });
-      saveJSON("jobseekers.json", jobseekers);
-    } else if (tempUser.role === "hr") {
-      const hrs = loadJSON("hrs.json");
-      hrs.push({
-        user_id: userId,
-        voat_id: voatId,
-        email: tempUser.email,
-      });
-      saveJSON("hrs.json", hrs);
+
+      await deletePendingSignup(pendingSignup.id);
+      res.json({ message: "Signup verified successfully" });
+    } catch (error) {
+      console.error("Error creating user in DB during signup verification:", error);
+      return res.status(500).json({ error: "Failed to verify OTP and create user" });
     }
-    delete tempUsers[tempToken];
 
-    res.json({ message: "Signup verified successfully" });
   } else if (type === "login") {
     // Verify login OTP
-    let users = loadUsers();
-    const user = users.find((u) => u.email === email);
+    const user = await findUserByEmail(email);
     if (!user) return res.status(400).json({ error: "Account not found" });
+
+    const now = Date.now();
+    console.log(`Debug: verifyOTP (login) - User ID: ${user.id}, Stored OTP: ${user.otp}, Stored OTP Expires: ${new Date(user.otpExpires).toLocaleString()}, Current Time: ${new Date(now).toLocaleString()}`);
+    const GLOBAL_LOGIN_ATTEMPTS_LIMIT = 5;
+    const OTP_LOGIN_ATTEMPTS_LIMIT = 3;
+    const ACCOUNT_BLOCK_DURATION = 5 * 60 * 1000; // 5 minutes
+
+    if (user.lockoutExpires && user.lockoutExpires > now) {
+        const remainingMillis = user.lockoutExpires - now;
+        const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
+        return res.status(429).json({ error: `Account temporarily blocked. Please try again in ${remainingMinutes} minute(s).` });
+    }
+
     if (!user.verified)
       return res.status(400).json({ error: "Account not verified" });
 
-    if (!user.otp || user.otpExpires < Date.now()) {
-      return res.status(400).json({ error: "OTP expired or not found" });
+    if (!user.otp || user.otpExpires < now) {
+      // This means OTP is expired or not found, but it should have been handled by requestLoginOTP's cooldown.
+      // If it still happens here, it means OTP expired during entry, or an invalid OTP was provided without being in cooldown.
+      return res.status(400).json({ error: "OTP expired or not found. Please request a new one." });
     }
 
     if (user.otp !== otp) {
-      user.loginAttempts = (user.loginAttempts || 0) + 1;
-      saveUsers(users);
+      let updates = {};
+      let errorMessage = "Incorrect OTP.";
 
-      if (user.loginAttempts >= 5) {
-        return res.status(429).json({ error: "Account temporarily blocked" });
+      // Increment OTP-specific attempts
+      const newOtpAttempts = (user.otpAttempts || 0) + 1;
+      updates.otpAttempts = newOtpAttempts;
+
+      // Increment overall login attempts
+      const newLoginAttempts = (user.loginAttempts || 0) + 1;
+      updates.loginAttempts = newLoginAttempts;
+      updates.lastFailedLoginAttempt = now; // Record time of failure
+
+      let otpAttemptsLeft = OTP_LOGIN_ATTEMPTS_LIMIT - newOtpAttempts;
+      let totalAttemptsLeft = GLOBAL_LOGIN_ATTEMPTS_LIMIT - newLoginAttempts;
+
+      if (newOtpAttempts >= OTP_LOGIN_ATTEMPTS_LIMIT) {
+          errorMessage = `Too many incorrect OTP attempts (${OTP_LOGIN_ATTEMPTS_LIMIT}).`;
+          updates.lockoutExpires = now + ACCOUNT_BLOCK_DURATION; // Block account
+          otpAttemptsLeft = 0;
+      }
+      if (newLoginAttempts >= GLOBAL_LOGIN_ATTEMPTS_LIMIT) {
+          errorMessage = `Too many overall login attempts (${GLOBAL_LOGIN_ATTEMPTS_LIMIT}).`;
+          updates.lockoutExpires = now + ACCOUNT_BLOCK_DURATION; // Block account
+          totalAttemptsLeft = 0;
+      }
+      if (newOtpAttempts < OTP_LOGIN_ATTEMPTS_LIMIT) {
+        errorMessage += ` ${otpAttemptsLeft} OTP attempts left.`;
+      }
+      if (newLoginAttempts < GLOBAL_LOGIN_ATTEMPTS_LIMIT) {
+        errorMessage += ` ${totalAttemptsLeft} total login attempts left.`;
       }
 
-      return res.status(400).json({ error: "Incorrect OTP" });
+      await updateUser(user.id, updates);
+      return res.status(400).json({ error: errorMessage, otpAttemptsLeft, totalAttemptsLeft });
     }
 
-    user.loginAttempts = 0;
-    delete user.otp;
-    delete user.otpExpires;
-    saveUsers(users);
+    // Successful OTP verification - reset all login-related counters
+    await updateUser(user.id, { loginAttempts: 0, otp: null, otpExpires: null, otpAttempts: 0, lastFailedLoginAttempt: null, lockoutExpires: null, lastOtpSent: now });
 
     const jwtToken = jwt.sign(
-      { email: user.email, role: user.role },
+      { id: user.id, email: user.email, role: user.role }, // Include user ID in token
       process.env.JWT_SECRET,
       { expiresIn: "1h" }
     );
 
     res.json({
-      message: "Login successful",
+      message: "Logged in Successfully",
       token: jwtToken,
-      data: { email: user.email, role: user.role, name: user.name },
+      data: { email: user.email, role: user.role, name: user.username, id: user.id }, // Include user ID in data
     });
-  } else {
-    res.status(400).json({ error: "Invalid OTP verification type" });
   }
 };
 
@@ -270,48 +382,29 @@ const verifyOTP = async (req, res) => {
 const requestPasswordReset = async (req, res) => {
   const { email } = req.body;
 
-  if (!email) {
-    return res.status(400).json({ error: "Email is required" });
+  if (!validator.isEmail(email)) {
+    return res.status(400).json({ error: "Invalid email" });
   }
 
-  let users = loadUsers();
-  const user = users.find(u => u.email === email);
-
-  // It's often a security best practice to respond the same way whether the email exists or not
-  // to prevent enumeration attacks. However, for debugging file-based, let's be explicit first.
+  const user = await findUserByEmail(email);
+  
+  // Security Best Practice: Respond generically to prevent user enumeration
   if (!user) {
     console.log(`Password reset requested for non-existent email: ${email}`);
-    // Respond as if successful to avoid revealing user existence
-    return res.json({ message: "If a user with that email exists, a password reset link has been sent." });
+    return res.json({ message: "If an account with that email exists, a password reset link has been sent." });
   }
 
+  const token = generateToken();
+  const resetExpires = Date.now() + 3600000; // 1 hour
+
   try {
-    // Generate a reset token (using a more robust method than UUID if possible, like crypto.randomBytes)
-    // For simplicity with UUID, let's use it, but add expiry.
-    const resetToken = uuidv4(); // Or use crypto.randomBytes(20).toString('hex');
-    const resetTokenExpiry = Date.now() + 3600000; // Token valid for 1 hour (3600000 ms)
-
-    // Store the token and expiry with the user
-    user.resetPasswordToken = resetToken;
-    user.resetPasswordExpires = resetTokenExpiry;
-    saveUsers(users); // Save the updated users array
-
-    // Create the reset link
-    // Replace process.env.FRONTEND_URL with your actual frontend base URL env var
-    const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
-
-    // Send the email using the new helper function
-    await sendPasswordResetEmail(user.email, resetLink);
-
-    console.log(`Password reset email logic completed for: ${email}`);
-
-    // Respond to the frontend
-    res.json({ message: "If a user with that email exists, a password reset link has been sent." });
-
+    await updateUser(user.id, { resetToken: token, resetExpires: resetExpires });
+    await sendPasswordResetEmail(email, token);
+    res.json({ message: "If an account with that email exists, a password reset link has been sent." });
   } catch (error) {
-    console.error(`Error requesting password reset for ${email}:`, error);
-    // Respond with a generic message even on error to prevent revealing user existence
-    res.status(500).json({ message: "An error occurred while processing your request. Please try again later." });
+    console.error("Password Reset Email Error:", error);
+    // On error, still return generic message to avoid revealing user existence
+    return res.status(500).json({ message: "An error occurred while sending the password reset email. Please try again later." });
   }
 };
 
@@ -319,203 +412,163 @@ const requestPasswordReset = async (req, res) => {
 const resetPassword = async (req, res) => {
   const { token, newPassword } = req.body;
 
-  if (!token || !newPassword) {
-    return res.status(400).json({ error: "Token and new password are required" });
+  if (!token) {
+    return res.status(400).json({ error: "Token is required" });
   }
-
-  let users = loadUsers();
-
-  // Find user by reset token and check expiry
-  const user = users.find(u => u.resetPasswordToken === token);
-
-  if (!user || user.resetPasswordExpires < Date.now()) {
-    return res.status(400).json({ error: "Invalid or expired reset token" });
-  }
-
-  // Validate new password
-  if (!validatePassword(newPassword)) {
+  const passwordErrors = validatePassword(newPassword);
+  if (passwordErrors.length > 0) {
     return res.status(400).json({
-      error:
-        "Password must be at least 6 characters, include uppercase & number",
+      error: "Password does not meet the requirements:",
+      details: passwordErrors
     });
   }
 
+  const userToReset = await findUserByResetToken(token);
+
+  if (!userToReset) {
+    return res.status(400).json({ error: "Invalid or expired token" });
+  }
+
+  const hashedPassword = await bcrypt.hash(newPassword, 10);
+
   try {
-    // Hash the new password
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-    // Update user's password and clear reset token fields
-    user.password = hashedPassword;
-    delete user.resetPasswordToken;
-    delete user.resetPasswordExpires;
-
-    saveUsers(users); // Save the updated users array
-
-    console.log(`Password successfully reset for email: ${user.email}`);
-
-    res.json({ message: "Password reset successful" });
-
+    await updateUser(userToReset.id, {
+      password: hashedPassword,
+      resetToken: null,
+      resetExpires: null,
+    });
+    res.json({ message: "Password has been reset" });
   } catch (error) {
-    console.error(`Error resetting password for token ${token}:`, error);
-    res.status(500).json({ message: "An error occurred while resetting your password." });
+    console.error("Password Reset Error:", error);
+    res.status(500).json({ error: "Failed to reset password" });
   }
 };
 
-// Verify Email Change Controller
-const verifyEmail = (req, res) => {
+// Verify Email Controller (for initial signup verification)
+const verifyEmail = async (req, res) => {
   const { token } = req.query;
 
   if (!token) {
-    return res.status(400).json({ error: "Verification token is required." });
+    return res.status(400).json({ error: "Verification token required" });
   }
 
-  let users = loadUsers();
+  const userToVerify = await findUserByVerificationToken(token);
 
-  // Find user by verification token
-  const user = users.find(u => u.emailVerificationToken === token);
-
-  if (!user) {
-    // Maybe redirect to an error page in a real app
-    return res.status(400).json({ error: "Invalid or expired verification token." });
+  if (!userToVerify) {
+    return res.status(400).json({ error: "Invalid or expired verification token" });
   }
 
-  // Check if the token has expired
-  if (user.emailTokenExpires && user.emailTokenExpires < Date.now()) {
-     // Clean up expired token fields
-    delete user.pendingEmail;
-    delete user.emailVerificationToken;
-    delete user.emailTokenExpires;
-    saveUsers(users);
-     // Maybe redirect to an error page or a resend verification page
-    return res.status(400).json({ error: "Verification token has expired. Please request a new email change." });
-  }
-
-  // Token is valid - update email
-  if (user.pendingEmail) {
-      user.email = user.pendingEmail;
-      user.verified = true; // Mark as verified if not already
-
-      // Clean up temporary fields
-      delete user.pendingEmail;
-      delete user.emailVerificationToken;
-      delete user.emailTokenExpires;
-
-      saveUsers(users);
-
-      // In a real app, you might redirect the user to a success page
-      res.json({ message: "Email verified successfully!" });
-  } else {
-      // Should not happen if pendingEmail was stored correctly
-      return res.status(500).json({ error: "Verification failed: Pending email not found." });
+  try {
+    await updateUser(userToVerify.id, { verified: true, verificationToken: null });
+    res.json({ message: "Email verified successfully" });
+  } catch (error) {
+    console.error("Email Verification Error:", error);
+    res.status(500).json({ error: "Failed to verify email" });
   }
 };
 
 // Secure Password Change Controller
 const changePassword = async (req, res) => {
-  const { currentPassword, newPassword } = req.body;
-  const userEmail = req.user.email; // Email from authenticated JWT payload
+  const { email, oldPassword, newPassword } = req.body;
 
-  if (!currentPassword || !newPassword) {
-    return res.status(400).json({ error: "Current password and new password are required." });
+  if (!validator.isEmail(email)) {
+    return res.status(400).json({ error: "Invalid email" });
   }
 
-  let users = loadUsers();
-  const user = users.find(u => u.email === userEmail);
-
-  if (!user) {
-    // This case should ideally not happen if authenticateJWT works correctly
-    console.error(`Authenticated user email not found in users.json: ${userEmail}`);
-    return res.status(404).json({ error: "Authenticated user not found." });
-  }
-
-  // Verify current password
-  const isMatch = await bcrypt.compare(currentPassword, user.password);
-  if (!isMatch) {
-    return res.status(401).json({ error: "Incorrect current password." });
-  }
-
-  // Validate new password
-  if (!validatePassword(newPassword)) {
+  const passwordErrors = validatePassword(newPassword);
+  if (passwordErrors.length > 0) {
     return res.status(400).json({
-      error:
-        "New password must be at least 6 characters, include uppercase & number",
+      error: "New password does not meet the requirements:",
+      details: passwordErrors
     });
   }
 
+  const user = await findUserByEmail(email);
+  if (!user) {
+    return res.status(400).json({ error: "Account not found" });
+  }
+
+  if (!(await bcrypt.compare(oldPassword, user.password))) {
+    return res.status(400).json({ error: "Incorrect old password" });
+  }
+
+  const hashedPassword = await bcrypt.hash(newPassword, 10);
+
   try {
-    // Hash the new password
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-    // Update user's password
-    user.password = hashedPassword;
-
-    saveUsers(users); // Save the updated users array
-
-    console.log(`Password successfully changed for email: ${userEmail}`);
-
-    res.json({ message: "Password changed successfully." });
-
+    await updateUser(user.id, { password: hashedPassword });
+    res.json({ message: "Password changed successfully" });
   } catch (error) {
-    console.error(`Error changing password for ${userEmail}:`, error);
-    res.status(500).json({ message: "An error occurred while changing your password." });
+    console.error("Change Password Error:", error);
+    res.status(500).json({ error: "Failed to change password" });
   }
 };
 
 // Request Email Change Controller
 const requestEmailChange = async (req, res) => {
-  const { newEmail } = req.body;
-  const userEmail = req.user.email; // Email from authenticated JWT payload
+  const { oldEmail, newEmail } = req.body;
 
-  if (!newEmail) {
-    return res.status(400).json({ error: "New email is required." });
+  if (!validator.isEmail(oldEmail) || !validator.isEmail(newEmail)) {
+    return res.status(400).json({ error: "Invalid email format" });
   }
 
-  if (!validator.isEmail(newEmail)) {
-    return res.status(400).json({ error: "Invalid new email format." });
+  const user = await findUserByEmail(oldEmail);
+  // Security Best Practice: Respond generically if old email not found
+  if (!user) {
+    console.log(`Email change requested for non-existent old email: ${oldEmail}`);
+    return res.status(400).json({ error: "Invalid request or account not found." }); // Generic error
   }
 
-  let users = loadUsers();
-  const user = users.find(u => u.email === userEmail);
-
-   if (!user) {
-    // This case should ideally not happen if authenticateJWT works correctly
-    console.error(`Authenticated user email not found in users.json for email change request: ${userEmail}`);
-    return res.status(404).json({ error: "Authenticated user not found." });
+  const existingNewEmailUser = await findUserByEmail(newEmail);
+  if (existingNewEmailUser) {
+    return res.status(400).json({ error: "New email is already in use" });
   }
 
-  // Check if the new email is the same as the current email
-  if (newEmail === user.email) {
-      return res.status(400).json({ message: "New email is the same as the current email." });
+  const verificationToken = generateToken();
+  const verificationExpires = Date.now() + 3600000; // 1 hour
+
+  try {
+    await updateUser(user.id, { newEmail: newEmail, verificationToken: verificationToken, verificationExpires: verificationExpires });
+    await sendEmailVerificationEmail(newEmail, verificationToken);
+    res.json({ message: "Verification email sent to new email (if account exists)." }); // Generic success message
+  } catch (error) {
+    console.error("Request Email Change Error:", error);
+    return res.status(500).json({ error: "Failed to send verification email." }); // Generic error
+  }
+};
+
+const verifyEmailChange = async (req, res) => {
+  const { token } = req.query;
+
+  if (!token) {
+    return res.status(400).json({ error: "Verification token required" });
   }
 
-  // Check if the new email is already in use by another user
-  if (users.some(u => u.email === newEmail || (u.pendingEmail === newEmail && u.emailVerificationToken && u.emailTokenExpires > Date.now()))) {
-      return res.status(400).json({ error: "Email is already in use." });
+  const userToVerify = await findUserByVerificationToken(token);
+
+  if (!userToVerify || !userToVerify.newEmail) {
+    return res.status(400).json({ error: "Invalid or expired verification token, or no pending email change." });
+  }
+
+  // Check if the token has expired (though findUserByVerificationToken already does this for reset/signup)
+  // For email change, it's tied to 'newEmail' which might not have 'verificationExpires' directly linked to it in the same way as `verificationToken` column.
+  // Re-checking the general `verificationExpires` on the user object is good.
+  if (userToVerify.verificationExpires < Date.now()) {
+    await updateUser(userToVerify.id, { newEmail: null, verificationToken: null, verificationExpires: null });
+    return res.status(400).json({ error: "Verification token has expired. Please request a new email change." });
   }
 
   try {
-    // Generate a verification token
-    const verificationToken = generateToken();
-    const verificationLink = `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`;
-
-    // Store pending email change details in the user object
-    user.pendingEmail = newEmail;
-    user.emailVerificationToken = verificationToken;
-    user.emailTokenExpires = Date.now() + 3600000; // Token valid for 1 hour
-
-    saveUsers(users); // Save the updated users array
-
-    // Send the email using the helper function
-    await sendEmailVerificationEmail(newEmail, verificationLink);
-
-    console.log(`Email verification initiated for ${userEmail} to ${newEmail}.`);
-
-    res.json({ message: "Verification email sent to your new address." });
-
+    // Update the primary email and clear pending change fields
+    await updateUser(userToVerify.id, {
+      email: userToVerify.newEmail, // Set new email as primary
+      newEmail: null,
+      verificationToken: null,
+      verificationExpires: null,
+    });
+    res.json({ message: "Email address updated successfully" });
   } catch (error) {
-    console.error(`Error requesting email change for ${userEmail}:`, error);
-    // Inform the user that the email could not be sent, but the request was processed.
-    res.status(500).json({ message: "Failed to send verification email. Please try again later." });
+    console.error("Email Change Verification Error:", error);
+    res.status(500).json({ error: "Failed to verify and update email address." });
   }
 };
 
@@ -533,5 +586,6 @@ module.exports = {
     verifyEmail,
     changePassword,
     requestEmailChange,
-    tempUsers // Export tempUsers if needed elsewhere, otherwise keep internal
+    verifyEmailChange,
+    // tempUsers // No longer needed, removed from export
 }; 
