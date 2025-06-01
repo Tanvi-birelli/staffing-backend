@@ -12,7 +12,12 @@ async function findUserByEmail(email) {
 }
 
 async function findUserByResetToken(token) {
-    const [rows] = await pool.execute('SELECT * FROM users WHERE resetToken = ? AND resetExpires > ?', [token, Date.now()]);
+    const currentTime = Date.now();
+    console.log(`Debug: findUserByResetToken - Token: ${token}, Current Time (ms): ${currentTime}, Current Time (Date): ${new Date(currentTime).toLocaleString()}`);
+    const [rows] = await pool.execute('SELECT * FROM users WHERE resetToken = ? AND resetExpires > ?', [token, currentTime]);
+    if (rows[0]) {
+        console.log(`Debug: findUserByResetToken - Found user. User ID: ${rows[0].id}, Stored resetExpires (ms): ${rows[0].resetExpires}, Stored resetExpires (Date): ${new Date(rows[0].resetExpires).toLocaleString()}`);
+    }
     return rows[0];
 }
 

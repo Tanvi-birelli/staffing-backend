@@ -27,7 +27,7 @@ const sendOTP = async (email, code) => {
     },
   });
 
-  const companyName = "Voat Networks"; // <<< Customize this
+  const companyName = process.env.COMPANY_NAME || "Your Company Name"; // Use env variable or fallback
 
   try {
     await transporter.sendMail({
@@ -71,7 +71,7 @@ const sendPasswordResetEmail = async (toEmail, resetLink) => {
     },
   });
 
-  const companyName = "Your Company Name"; // <<< Customize this
+  const companyName = process.env.COMPANY_NAME || "Your Company Name"; // Use env variable or fallback
 
   try {
     await transporter.sendMail({
@@ -118,7 +118,7 @@ const sendEmailVerificationEmail = async (toEmail, verificationLink) => {
     },
   });
 
-  const companyName = "Your Company Name"; // <<< Customize this
+  const companyName = process.env.COMPANY_NAME || "Your Company Name"; // Use env variable or fallback
 
   try {
     await transporter.sendMail({

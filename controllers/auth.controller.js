@@ -429,6 +429,11 @@ const resetPassword = async (req, res) => {
     return res.status(400).json({ error: "Invalid or expired token" });
   }
 
+  // Check if the new password is the same as the old password
+  if (await bcrypt.compare(newPassword, userToReset.password)) {
+    return res.status(400).json({ error: "New password cannot be the same as the old password." });
+  }
+
   const hashedPassword = await bcrypt.hash(newPassword, 10);
 
   try {
@@ -490,6 +495,11 @@ const changePassword = async (req, res) => {
 
   if (!(await bcrypt.compare(oldPassword, user.password))) {
     return res.status(400).json({ error: "Incorrect old password" });
+  }
+
+  // Check if the new password is the same as the old password
+  if (await bcrypt.compare(newPassword, user.password)) {
+    return res.status(400).json({ error: "New password cannot be the same as the old password." });
   }
 
   const hashedPassword = await bcrypt.hash(newPassword, 10);
