@@ -10,7 +10,7 @@ const submitContact = async (req, res) => {
   
   try {
     await createContact({ name, email, subject, message });
-    res.json({ message: "Contact message received" });
+  res.json({ message: "Contact message received" });
   } catch (error) {
     console.error("Error submitting contact form:", error);
     res.status(500).json({ error: "Failed to submit contact message" });

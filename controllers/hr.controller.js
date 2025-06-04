@@ -1,4 +1,3 @@
-const { loadJSON, saveJSON, updateIds } = require("../utils/fileHelpers");
 const { pool } = require("../config/db");
 const validator = require("validator");
 const { findUserByEmail, updateUser } = require("../utils/dbHelpers");
@@ -16,8 +15,7 @@ const getProfile = async (req, res) => {
       return res.status(404).json({ error: "HR profile not found" });
     }
 
-    // Currently, HR profiles are assumed to be stored primarily in the users table.
-    // If there's a separate 'hr_profiles' table with more fields, it would be joined here.
+    // HR profiles are assumed to be stored primarily in the users table.
     res.json(user);
   } catch (error) {
     console.error("Error fetching HR profile:", error);
@@ -27,11 +25,15 @@ const getProfile = async (req, res) => {
 
 const updateProfile = async (req, res) => {
   try {
-    const { username } = req.body; // Assuming only username is updatable for now
+    const { username, voat_id } = req.body; // Including voat_id as an updatable field
     const errors = [];
 
     if (username !== undefined && (typeof username !== 'string' || username.trim().length === 0 || username.length > 255)) {
       errors.push("Username must be a non-empty string and less than 255 characters.");
+    }
+    // Add validation for voat_id if needed, e.g., format or uniqueness
+    if (voat_id !== undefined && (typeof voat_id !== 'string' || voat_id.trim().length === 0 || voat_id.length > 50)) { // Example validation
+      errors.push("VOAT ID must be a non-empty string and less than 50 characters.");
     }
 
     if (errors.length > 0) {
@@ -44,17 +46,18 @@ const updateProfile = async (req, res) => {
       return res.status(404).json({ error: "HR profile not found" });
     }
 
-    // Only update allowed fields
     const updates = {};
     if (username !== undefined) {
       updates.username = username;
+    }
+    if (voat_id !== undefined) {
+      updates.voat_id = voat_id;
     }
 
     if (Object.keys(updates).length > 0) {
       await updateUser(user.id, updates);
     }
 
-    // Fetch the updated profile to send back in the response
     const [updatedUsers] = await pool.execute(
       "SELECT id, username, email, role, verified, voat_id FROM users WHERE id = ?",
       [req.user.id]
@@ -72,7 +75,7 @@ const updateProfile = async (req, res) => {
 const getSchedule = async (req, res) => {
   try {
     const [schedules] = await pool.execute(
-      "SELECT * FROM interviews WHERE hr_id = ?", // Assuming hr_id is in interviews table
+      "SELECT * FROM interviews WHERE interviewer_id = ?",
       [req.user.id]
     );
     res.json(schedules);
@@ -132,137 +135,99 @@ const markAllNotificationsRead = async (req, res) => {
 };
 
 // HR Application Management & Interview Scheduling Controllers
-const scheduleInterview = (req, res) => {
+const scheduleInterview = async (req, res) => {
   const { applicationId } = req.params;
   const { interviewDate, interviewTime, interviewLocation, notes } = req.body;
 
-  if (!interviewDate || !interviewTime || !interviewLocation) {
-    return res.status(400).json({ error: "Missing required interview details (date, time, location)" });
+  if (!applicationId || !interviewDate || !interviewTime || !interviewLocation) {
+    return res.status(400).json({ error: "Missing required interview details (applicationId, date, time, location)" });
   }
 
-  let jobs = loadJSON("jobs.json");
-  let schedules = loadJSON("schedules.json");
-  let notifications = loadJSON("notifications.json");
-  const users = loadJSON("users.json");
+  try {
+    // 1. Find the application and its associated job and jobseeker
+    const [applications] = await pool.execute(
+      `SELECT ja.application_id, ja.job_id, ja.jobseeker_id, j.title AS job_title
+       FROM job_applications ja
+       JOIN jobs j ON ja.job_id = j.id
+       WHERE ja.application_id = ?`, 
+      [applicationId]
+    );
 
-  let jobFound = null;
-  let applicationFound = null;
-  let jobIndex = -1;
-  let applicationIndex = -1;
+    const application = applications[0];
 
-  // Find the application and the job it belongs to
-  for (let i = 0; i < jobs.length; i++) {
-    const job = jobs[i];
-    const appIndex = job.applications.findIndex(app => app.applicationId === parseInt(applicationId, 10));
-    if (appIndex !== -1) {
-      jobFound = job;
-      jobIndex = i;
-      applicationFound = job.applications[appIndex];
-      applicationIndex = appIndex;
-      break;
+    if (!application) {
+      return res.status(404).json({ error: "Application not found" });
     }
-  }
 
-  if (!jobFound || !applicationFound) {
-    return res.status(404).json({ error: "Application not found" });
-  }
+    // Check if HR user is authorized to schedule for this job (e.g., if job belongs to this HR)
+    // This requires a `hr_id` in the `jobs` table or a job-hr association table.
+    // For now, assuming HR can schedule for any job applications.
+    const [hrUser] = await pool.execute("SELECT id, username, email, role FROM users WHERE id = ?", [req.user.id]);
+    const [jobseekerUser] = await pool.execute("SELECT id, username, email, role FROM users WHERE id = ?", [application.jobseeker_id]);
 
-  const jobseekerEmail = applicationFound.jobseekerEmail;
-  const hrEmail = req.user.email;
-
-  const jobseekerUser = users.find(u => u.email === jobseekerEmail);
-  const hrUser = users.find(u => u.email === hrEmail);
-
-  if (!jobseekerUser || !hrUser) {
-      console.error("User data not found for scheduling interview.", { jobseekerEmail, hrEmail });
+    if (!hrUser[0] || !jobseekerUser[0]) {
+      console.error("User data not found for scheduling interview.", { hrId: req.user.id, jobseekerId: application.jobseeker_id });
       return res.status(500).json({ error: "Internal server error: User data missing." });
+    }
+
+    // 2. Insert into interviews table
+    const [interviewResult] = await pool.execute(
+      `INSERT INTO interviews (application_id, interviewer_id, jobseeker_id, interview_date, interview_time, interview_location, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`, 
+      [application.application_id, req.user.id, application.jobseeker_id, interviewDate, interviewTime, interviewLocation, notes || ""]
+    );
+    const interviewId = interviewResult.insertId;
+
+    // 3. Create notifications for HR and Jobseeker
+    const now = new Date();
+
+    // Notification for HR
+    await pool.execute(
+      `INSERT INTO notifications (user_id, role, type, title, message, is_read, created_at, related_job_id, related_application_id, related_user_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+      [
+        req.user.id,
+        'hr',
+        'interview',
+        `Interview Scheduled for ${jobseekerUser[0].username}`,
+        `An interview has been scheduled for application ${application.application_id} for the job ${application.job_title}.`,
+        false,
+        now,
+        application.job_id,
+        application.application_id,
+        application.jobseeker_id
+      ]
+    );
+
+    // Notification for Jobseeker
+    await pool.execute(
+      `INSERT INTO notifications (user_id, role, type, title, message, is_read, created_at, related_job_id, related_application_id, related_user_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+      [
+        application.jobseeker_id,
+        'jobseeker',
+        'interview',
+        `Interview Scheduled for Your Application`,
+        `Your interview for the job ${application.job_title} (Application ID: ${application.application_id}) has been scheduled. Check your schedule for details.`,
+        false,
+        now,
+        application.job_id,
+        application.application_id,
+        req.user.id
+      ]
+    );
+
+    // 4. Update application status (if `job_applications` table has a status field)
+    await pool.execute(
+      `UPDATE job_applications SET status = ?, interview_details = ? WHERE application_id = ?`, 
+      ['Interview Scheduled', JSON.stringify({ interviewDate, interviewTime, interviewLocation, notes }), application.application_id]
+    );
+
+    res.status(200).json({ message: "Interview scheduled successfully", interviewId, application });
+  } catch (error) {
+    console.error("Error scheduling interview:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
-
-  // Generate unique IDs for new schedule and notification entries
-  const hrScheduleId = updateIds("scheduleId"); // Assuming 'scheduleId' counter exists in meta.json
-  const jobseekerScheduleId = updateIds("scheduleId");
-  const hrNotificationId = updateIds("notificationId"); // Assuming 'notificationId' counter exists
-  const jobseekerNotificationId = updateIds("notificationId");
-
-  const interviewDetails = {
-    date: interviewDate,
-    time: interviewTime,
-    location: interviewLocation,
-    notes: notes || ""
-  };
-
-  // Create schedule for HR
-  const hrSchedule = {
-    id: hrScheduleId,
-    email: hrEmail,
-    role: 'hr',
-    type: 'interview',
-    title: `Interview with ${jobseekerUser.name} for ${jobFound.title}`,
-    description: `Interview for job application ${applicationId}`,
-    ...interviewDetails,
-    jobId: jobFound.job_id,
-    applicationId: parseInt(applicationId, 10),
-    participantEmail: jobseekerEmail,
-  };
-  schedules.push(hrSchedule);
-
-  // Create schedule for Jobseeker
-  const jobseekerSchedule = {
-    id: jobseekerScheduleId,
-    email: jobseekerEmail,
-    role: 'jobseeker',
-    type: 'interview',
-    title: `Interview for ${jobFound.title}`,
-    description: `Your interview for job application ${applicationId}`,
-    ...interviewDetails,
-    jobId: jobFound.job_id,
-    applicationId: parseInt(applicationId, 10),
-    participantEmail: hrEmail,
-  };
-  schedules.push(jobseekerSchedule);
-
-  // Create notification for HR
-  const hrNotification = {
-    id: hrNotificationId,
-    email: hrEmail,
-    role: 'hr',
-    type: 'interview',
-    title: `Interview Scheduled for ${jobseekerUser.name}`,
-    message: `An interview has been scheduled for application ${applicationId} for the job ${jobFound.title}.`,
-    read: false,
-    createdAt: new Date().toISOString(),
-    relatedJobId: jobFound.job_id,
-    relatedApplicationId: parseInt(applicationId, 10),
-    relatedUserEmail: jobseekerEmail,
-  };
-  notifications.push(hrNotification);
-
-  // Create notification for Jobseeker
-  const jobseekerNotification = {
-    id: jobseekerNotificationId,
-    email: jobseekerEmail,
-    role: 'jobseeker',
-    type: 'interview',
-    title: `Interview Scheduled for Your Application`,
-    message: `Your interview for the job ${jobFound.title} (Application ID: ${applicationId}) has been scheduled. Check your schedule for details.`, // Could add link here
-    read: false,
-    createdAt: new Date().toISOString(),
-    relatedJobId: jobFound.job_id,
-    relatedApplicationId: parseInt(applicationId, 10),
-    relatedUserEmail: hrEmail,
-  };
-  notifications.push(jobseekerNotification);
-
-  // Update application status and add interview details
-  jobs[jobIndex].applications[applicationIndex].status = 'Interview Scheduled';
-  jobs[jobIndex].applications[applicationIndex].interviewDetails = interviewDetails;
-
-  // Save updated data
-  saveJSON("jobs.json", jobs);
-  saveJSON("schedules.json", schedules);
-  saveJSON("notifications.json", notifications);
-
-  res.status(200).json({ message: "Interview scheduled successfully", hrSchedule, jobseekerSchedule, hrNotification, jobseekerNotification });
 };
 
 module.exports = {

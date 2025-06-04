@@ -13,6 +13,9 @@ router.post(
   authController.signup
 );
 
+// Resend Signup OTP Route
+router.post("/resend-signup-otp", signInOtpLimiter, authController.resendSignupOTP);
+
 // Login with Password Route
 router.post("/login-password", authController.loginPassword);
 

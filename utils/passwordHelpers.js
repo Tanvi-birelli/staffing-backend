@@ -11,6 +11,9 @@ const validatePassword = (pw) => {
   if (!/\d/.test(pw)) {
     errors.push("Password must include at least one number");
   }
+  if (!/[!@#$%^&*(),.?":{}|<>]/.test(pw)) {
+    errors.push("Password must include at least one special character");
+  }
 
   return errors; // Return array of errors (empty if valid)
 };

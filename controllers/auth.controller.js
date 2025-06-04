@@ -2,11 +2,12 @@ const bcrypt = require("bcryptjs");
 const validator = require("validator");
 const jwt = require("jsonwebtoken");
 const { v4: uuidv4 } = require("uuid");
+const { loadUsers, saveUsers, updateIds, loadJSON, saveJSON } = require("../utils/fileHelpers");
 const { generateOTP, sendOTP, sendPasswordResetEmail, generateToken, sendEmailVerificationEmail } = require("../utils/otpHelpers");
 const validatePassword = require("../utils/passwordHelpers");
 const crypto = require('crypto'); // Import crypto for token generation
 const { findUserByEmail, createUser, updateUser, findUserByResetToken, findUserByVerificationToken, createPendingSignup, findPendingSignupByEmail, updatePendingSignup, deletePendingSignup, findPendingSignupByToken } = require("../utils/dbHelpers");
-const { pool } = require("../config/db");
+const { pool } = require("../utils/dbHelpers");
 
 // const tempUsers = {}; // This will be replaced by pending_signups table
 
@@ -91,6 +92,67 @@ const signup = async (req, res) => {
   }
 };
 
+// Resend Signup OTP Controller
+const resendSignupOTP = async (req, res) => {
+  const { email, tempToken } = req.body;
+
+  if (!validator.isEmail(email)) {
+    return res.status(400).json({ error: "Invalid email" });
+  }
+
+  if (!tempToken) {
+    return res.status(400).json({ error: "Invalid or missing temporary token." });
+  }
+
+  const pendingSignup = await findPendingSignupByToken(tempToken);
+
+  if (!pendingSignup || pendingSignup.email !== email) {
+    return res.status(400).json({ error: "Invalid or expired token, or email mismatch." });
+  }
+
+  const now = Date.now();
+  const OTP_COOLDOWN = 30 * 1000; // 30 seconds
+  const MAX_OTP_SEND_ATTEMPTS = 3; // Max times OTP can be sent for a single signup attempt
+  const SIGNUP_BLOCK_DURATION = 5 * 60 * 1000; // 5 minutes
+
+  // Check if currently blocked for sending OTPs
+  if (pendingSignup.blockExpires && pendingSignup.blockExpires > now) {
+    const remainingMillis = pendingSignup.blockExpires - now;
+    const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
+    return res.status(429).json({ error: `Too many OTP send attempts. Please try again in ${remainingMinutes} minute(s).` });
+  }
+
+  // Check OTP resend cooldown
+  if (pendingSignup.lastOtpSent && (now - pendingSignup.lastOtpSent) < OTP_COOLDOWN) {
+    const remainingSeconds = Math.ceil((OTP_COOLDOWN - (now - pendingSignup.lastOtpSent)) / 1000);
+    return res.status(429).json({ error: `Please wait ${remainingSeconds} second(s) before requesting another OTP.` });
+  }
+
+  // Increment OTP send attempts
+  const newOtpSendAttempts = (pendingSignup.otpAttempts || 0) + 1; // Re-purposing otpAttempts for send attempts
+  let updates = { lastOtpSent: now, otpAttempts: newOtpSendAttempts };
+
+  if (newOtpSendAttempts > MAX_OTP_SEND_ATTEMPTS) {
+    updates.blockExpires = now + SIGNUP_BLOCK_DURATION;
+    const blockDurationMinutes = Math.ceil(SIGNUP_BLOCK_DURATION / (60 * 1000));
+    await updatePendingSignup(pendingSignup.id, updates);
+    return res.status(429).json({ error: `Too many OTP send attempts (${MAX_OTP_SEND_ATTEMPTS}). Account temporarily blocked for sending OTPs. Please try again in ${blockDurationMinutes} minute(s).` });
+  }
+
+  const newOtp = generateOTP();
+  updates.otpCode = newOtp;
+  updates.otpExpires = now + 5 * 60 * 1000; // New OTP valid for 5 minutes
+
+  try {
+    await updatePendingSignup(pendingSignup.id, updates);
+    await sendOTP(email, newOtp);
+    res.json({ message: "New OTP sent successfully!", tempToken });
+  } catch (error) {
+    console.error("Error resending OTP:", error);
+    return res.status(500).json({ error: "Failed to resend OTP." });
+  }
+};
+
 // Login with Password Controller
 const loginPassword = async (req, res) => {
   const { email, password } = req.body;
@@ -101,8 +163,7 @@ const loginPassword = async (req, res) => {
 
   const user = await findUserByEmail(email);
 
-  // Ambiguous response to prevent user enumeration
-  if (!user) return res.status(400).json({ error: "Invalid credentials." });
+  if (!user) return res.status(400).json({ error: "Account not found" });
 
   const now = Date.now();
   const GLOBAL_LOGIN_ATTEMPTS_LIMIT = 5;
@@ -111,7 +172,7 @@ const loginPassword = async (req, res) => {
   if (user.lockoutExpires && user.lockoutExpires > now) {
       const remainingMillis = user.lockoutExpires - now;
       const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
-      return res.status(429).json({ error: `Account temporarily blocked. Please try again in ${remainingMinutes} minute(s).` });
+      return res.status(429).json({ error: `Account temporarily blocked due to too many login attempts. Please try again in ${remainingMinutes} minute(s).` });
   }
 
   if (!user.verified)
@@ -129,7 +190,7 @@ const loginPassword = async (req, res) => {
     if (newLoginAttempts >= GLOBAL_LOGIN_ATTEMPTS_LIMIT) {
       updates.lockoutExpires = now + ACCOUNT_BLOCK_DURATION;
       const blockDurationMinutes = Math.ceil(ACCOUNT_BLOCK_DURATION / (60 * 1000));
-      errorMessage = `Too many incorrect password attempts (${GLOBAL_LOGIN_ATTEMPTS_LIMIT}). Account temporarily blocked. Please try again in ${blockDurationMinutes} minute(s).`;
+      errorMessage = `Account temporarily blocked due to too many incorrect password attempts (${GLOBAL_LOGIN_ATTEMPTS_LIMIT} failed attempts). Please try again in ${blockDurationMinutes} minute(s).`;
       attemptsLeft = 0; // No attempts left
     } else {
       errorMessage += ` ${attemptsLeft} attempts left.`;
@@ -166,8 +227,7 @@ const requestLoginOTP = async (req, res) => {
 
   const user = await findUserByEmail(email);
 
-  // Ambiguous response to prevent user enumeration
-  if (!user) return res.json({ message: "If an account with that email exists, an OTP has been sent." });
+  if (!user) return res.status(400).json({ error: "Account not found" });
 
   const now = Date.now();
   const OTP_COOLDOWN = 30 * 1000; // 30 seconds
@@ -176,7 +236,7 @@ const requestLoginOTP = async (req, res) => {
   if (user.lockoutExpires && user.lockoutExpires > now) {
     const remainingMillis = user.lockoutExpires - now;
     const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
-    return res.status(429).json({ error: `Account temporarily blocked. Please try again in ${remainingMinutes} minute(s).` });
+    return res.status(429).json({ error: `Account temporarily blocked due to too many OTP requests. Please try again in ${remainingMinutes} minute(s).` });
   }
 
   if (!user.verified)
@@ -239,7 +299,7 @@ const verifyOTP = async (req, res) => {
     if (pendingSignup.blockExpires && pendingSignup.blockExpires > now) {
       const remainingMillis = pendingSignup.blockExpires - now;
       const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
-      return res.status(429).json({ error: `Too many signup attempts. Please try again in ${remainingMinutes} minute(s).` });
+      return res.status(429).json({ error: `Account temporarily blocked due to too many signup attempts. Please try again in ${remainingMinutes} minute(s).` });
     }
 
     if (pendingSignup.otpExpires < now) {
@@ -256,11 +316,11 @@ const verifyOTP = async (req, res) => {
       if (newAttempts >= SIGNUP_OTP_ATTEMPTS_LIMIT) {
         updates.blockExpires = now + SIGNUP_BLOCK_DURATION;
         const blockDurationMinutes = Math.ceil(SIGNUP_BLOCK_DURATION / (60 * 1000));
-        errorMessage = `Too many incorrect OTP attempts (${SIGNUP_OTP_ATTEMPTS_LIMIT}). Account temporarily blocked for signup. Please try again in ${blockDurationMinutes} minute(s).`;
+        errorMessage = `Account temporarily blocked due to too many incorrect OTP attempts (${SIGNUP_OTP_ATTEMPTS_LIMIT} failed attempts). Please try again in ${blockDurationMinutes} minute(s).`;
         attemptsLeft = 0; // No attempts left
       } else {
         errorMessage += ` ${attemptsLeft} attempts left.`;
-      }
+    }
 
       await updatePendingSignup(pendingSignup.id, updates);
       return res.status(400).json({ error: errorMessage, attemptsLeft: attemptsLeft });
@@ -285,7 +345,7 @@ const verifyOTP = async (req, res) => {
         hashedPassword: pendingSignup.hashedPassword,
         role: pendingSignup.role,
         voatId: voatId,
-        verified: true,
+      verified: true,
         resume_filepath: pendingSignup.resume_filepath
       });
 
@@ -310,7 +370,7 @@ const verifyOTP = async (req, res) => {
     if (user.lockoutExpires && user.lockoutExpires > now) {
         const remainingMillis = user.lockoutExpires - now;
         const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
-        return res.status(429).json({ error: `Account temporarily blocked. Please try again in ${remainingMinutes} minute(s).` });
+        return res.status(429).json({ error: `Account temporarily blocked due to too many login attempts. Please try again in ${remainingMinutes} minute(s).` });
     }
 
     if (!user.verified)
@@ -339,12 +399,12 @@ const verifyOTP = async (req, res) => {
       let totalAttemptsLeft = GLOBAL_LOGIN_ATTEMPTS_LIMIT - newLoginAttempts;
 
       if (newOtpAttempts >= OTP_LOGIN_ATTEMPTS_LIMIT) {
-          errorMessage = `Too many incorrect OTP attempts (${OTP_LOGIN_ATTEMPTS_LIMIT}).`;
+          errorMessage = `Account temporarily blocked due to too many incorrect OTP attempts (${OTP_LOGIN_ATTEMPTS_LIMIT} failed attempts).`;
           updates.lockoutExpires = now + ACCOUNT_BLOCK_DURATION; // Block account
           otpAttemptsLeft = 0;
       }
       if (newLoginAttempts >= GLOBAL_LOGIN_ATTEMPTS_LIMIT) {
-          errorMessage = `Too many overall login attempts (${GLOBAL_LOGIN_ATTEMPTS_LIMIT}).`;
+          errorMessage = `Account temporarily blocked due to too many overall login attempts (${GLOBAL_LOGIN_ATTEMPTS_LIMIT} failed attempts).`;
           updates.lockoutExpires = now + ACCOUNT_BLOCK_DURATION; // Block account
           totalAttemptsLeft = 0;
       }
@@ -385,7 +445,7 @@ const requestPasswordReset = async (req, res) => {
   }
 
   const user = await findUserByEmail(email);
-  
+
   // Security Best Practice: Respond generically to prevent user enumeration
   if (!user) {
     console.log(`Password reset requested for non-existent email: ${email}`);
@@ -500,7 +560,7 @@ const changePassword = async (req, res) => {
     return res.status(400).json({ error: "New password cannot be the same as the old password." });
   }
 
-  const hashedPassword = await bcrypt.hash(newPassword, 10);
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
 
   try {
     await updateUser(user.id, { password: hashedPassword });
@@ -518,18 +578,17 @@ const requestEmailChange = async (req, res) => {
   if (!validator.isEmail(oldEmail) || !validator.isEmail(newEmail)) {
     return res.status(400).json({ error: "Invalid email format" });
   }
-  if (oldEmail === newEmail) {
-    return res.status(400).json({ error: "New email cannot be the same as the old email." });
-  }
 
   const user = await findUserByEmail(oldEmail);
+  // Security Best Practice: Respond generically if old email not found
   if (!user) {
-    return res.status(400).json({ error: "Account not found with provided old email." });
+    console.log(`Email change requested for non-existent old email: ${oldEmail}`);
+    return res.status(400).json({ error: "Invalid request or account not found." }); // Generic error
   }
 
   const existingNewEmailUser = await findUserByEmail(newEmail);
   if (existingNewEmailUser) {
-    return res.status(400).json({ error: "New email is already in use by another account." });
+    return res.status(400).json({ error: "New email is already in use" });
   }
 
   const verificationToken = generateToken();
@@ -537,15 +596,14 @@ const requestEmailChange = async (req, res) => {
 
   try {
     await updateUser(user.id, { newEmail: newEmail, verificationToken: verificationToken, verificationExpires: verificationExpires });
-    await sendEmailVerificationEmail(newEmail, verificationToken, "email_change");
-    res.json({ message: "Verification link sent to new email address." });
+    await sendEmailVerificationEmail(newEmail, verificationToken);
+    res.json({ message: "Verification email sent to new email (if account exists)." }); // Generic success message
   } catch (error) {
     console.error("Request Email Change Error:", error);
-    res.status(500).json({ error: "Failed to request email change." });
+    return res.status(500).json({ error: "Failed to send verification email." }); // Generic error
   }
 };
 
-// Verify Email Change Controller
 const verifyEmailChange = async (req, res) => {
   const { token } = req.query;
 
@@ -555,36 +613,48 @@ const verifyEmailChange = async (req, res) => {
 
   const userToVerify = await findUserByVerificationToken(token);
 
-  if (!userToVerify || !userToVerify.newEmail || userToVerify.verificationExpires < Date.now()) {
-    return res.status(400).json({ error: "Invalid or expired verification token for email change." });
+  if (!userToVerify || !userToVerify.newEmail) {
+    return res.status(400).json({ error: "Invalid or expired verification token, or no pending email change." });
+  }
+
+  // Check if the token has expired (though findUserByVerificationToken already does this for reset/signup)
+  // For email change, it's tied to 'newEmail' which might not have 'verificationExpires' directly linked to it in the same way as `verificationToken` column.
+  // Re-checking the general `verificationExpires` on the user object is good.
+  if (userToVerify.verificationExpires < Date.now()) {
+    await updateUser(userToVerify.id, { newEmail: null, verificationToken: null, verificationExpires: null });
+    return res.status(400).json({ error: "Verification token has expired. Please request a new email change." });
   }
 
   try {
+    // Update the primary email and clear pending change fields
     await updateUser(userToVerify.id, {
-      email: userToVerify.newEmail,
+      email: userToVerify.newEmail, // Set new email as primary
       newEmail: null,
       verificationToken: null,
       verificationExpires: null,
     });
-    res.json({ message: "Email changed successfully." });
+    res.json({ message: "Email address updated successfully" });
   } catch (error) {
-    console.error("Verify Email Change Error:", error);
-    res.status(500).json({ error: "Failed to verify email change." });
+    console.error("Email Change Verification Error:", error);
+    res.status(500).json({ error: "Failed to verify and update email address." });
   }
 };
 
+// Keep tempUsers in this file for now, or consider a more robust temporary storage
+// Need padNumber function for verifyOTP signup case - assuming it's a helper
 const padNumber = (num, length = 3) => String(num).padStart(length, "0");
 
 module.exports = {
-  signup,
-  loginPassword,
-  requestLoginOTP,
-  verifyOTP,
-  requestPasswordReset,
-  resetPassword,
-  verifyEmail,
-  changePassword,
-  requestEmailChange,
-  verifyEmailChange,
-  // tempUsers // No longer needed, removed from export
+    signup,
+    loginPassword,
+    requestLoginOTP,
+    verifyOTP,
+    requestPasswordReset,
+    resetPassword,
+    verifyEmail,
+    changePassword,
+    requestEmailChange,
+    verifyEmailChange,
+    resendSignupOTP,
+    // tempUsers // No longer needed, removed from export
 }; 

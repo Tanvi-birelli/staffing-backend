@@ -38,7 +38,7 @@ const updateProfile = async (req, res) => {
     const { bio, portfolio, education, experience_years, skills, projects, certifications, resume_filepath } = req.body;
     const errors = [];
 
-    // Input validation (to be applied after re-migration)
+    // Input validation
     if (bio !== undefined && (typeof bio !== 'string' || bio.length > 1000)) {
       errors.push("Bio must be a string and less than 1000 characters.");
     }
