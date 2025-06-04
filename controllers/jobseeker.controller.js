@@ -19,12 +19,12 @@ const getProfile = async (req, res) => {
     );
     const jobseeker = jobseekers[0];
 
-    const profile = {
-      ...user,
+  const profile = {
+    ...user,
       ...(jobseeker || {}),
-    };
+  };
 
-    res.json(profile);
+  res.json(profile);
   } catch (error) {
     console.error("Error fetching job seeker profile:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -85,7 +85,7 @@ const updateProfile = async (req, res) => {
 const getJobs = async (req, res) => {
   try {
     const [jobs] = await pool.execute("SELECT * FROM jobs");
-    res.json(jobs);
+  res.json(jobs);
   } catch (error) {
     console.error("Error fetching jobs:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -101,7 +101,7 @@ const getAppliedJobs = async (req, res) => {
        WHERE ja.jobseeker_id = ?`,
       [req.user.id]
     );
-    res.json(appliedJobs);
+  res.json(appliedJobs);
   } catch (error) {
     console.error("Error fetching applied jobs:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -158,7 +158,7 @@ const getNotifications = async (req, res) => {
     let query = "SELECT * FROM notifications WHERE user_id = ?";
     const params = [req.user.id];
 
-    if (date) {
+  if (date) {
       query += " AND DATE(created_at) = ?";
       params.push(date);
     }
@@ -184,7 +184,7 @@ const markNotificationRead = async (req, res) => {
       return res.status(404).json({ error: "Notification not found or does not belong to user" });
     }
 
-    res.json({ message: "Notification marked as read" });
+  res.json({ message: "Notification marked as read" });
   } catch (error) {
     console.error("Error marking notification as read:", error);
     res.status(500).json({ error: "Internal server error" });

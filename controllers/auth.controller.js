@@ -40,57 +40,116 @@ const signup = async (req, res) => {
 
   const existingUser = await findUserByEmail(email);
   if (existingUser) {
-    return res.json({ message: "If an account with that email exists, an OTP has been sent for verification." });
+    // Ambiguous response to prevent email enumeration for existing, verified users
+    return res.json({ message: "If an account with that email exists, please proceed to login or password reset." });
   }
 
   let pendingSignup = await findPendingSignupByEmail(email);
   const now = Date.now();
-  const OTP_COOLDOWN = 30 * 1000; // 30 seconds
   const SIGNUP_BLOCK_DURATION = 5 * 60 * 1000; // 5 minutes
-  const MAX_OTP_SEND_ATTEMPTS = 3; // Max times OTP can be sent for a single signup attempt
 
   if (pendingSignup) {
-    // Check if currently blocked for signup (from too many failed OTP verifications OR too many send attempts)
+    // Check if currently blocked for signup
     if (pendingSignup.blockExpires && pendingSignup.blockExpires > now) {
       const remainingMillis = pendingSignup.blockExpires - now;
       const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
-      return res.status(429).json({ error: `Account temporarily blocked due to too many signup attempts. Please try again in ${remainingMinutes} minute(s).` });
+      return res.status(429).json({ error: `Too many signup attempts. Please try again in ${remainingMinutes} minute(s).` });
     }
 
-    // Check OTP resend cooldown
-    if (pendingSignup.lastOtpSent && (now - pendingSignup.lastOtpSent) < OTP_COOLDOWN) {
-      const remainingSeconds = Math.ceil((OTP_COOLDOWN - (now - pendingSignup.lastOtpSent)) / 1000);
-      console.log(`Debug: Cooldown active. Remaining seconds: ${remainingSeconds}`);
-      return res.status(429).json({ error: `Please wait ${remainingSeconds} second(s) before requesting another OTP.` });
-    }
-
-    // If a pending signup already exists and not blocked/cooldown, direct user to verify or resend OTP
-    return res.status(200).json({
-      message: "A pending signup already exists for this email. Please verify your OTP or use the resend OTP option.",
-      tempToken: pendingSignup.tempToken
+    // If pending signup exists and not blocked, direct to resend OTP endpoint
+    return res.status(409).json({
+        message: "A pending signup already exists for this email. Please verify OTP or use the resend OTP endpoint.",
+        tempToken: pendingSignup.tempToken // Provide the existing tempToken
     });
+  }
 
-  } else {
-    // First signup attempt for this email
-    const otp = generateOTP();
-    const tempToken = uuidv4();
-    const otpExpires = now + 5 * 60 * 1000; // OTP valid for 5 minutes
+  // If no existing user and no pending signup, proceed with new signup process
+  const otp = generateOTP();
+  const tempToken = uuidv4();
+  const otpExpires = now + 5 * 60 * 1000; // OTP valid for 5 minutes
 
-    const signupData = {
-      name,
-      email,
-      hashedPassword: await bcrypt.hash(password, 10),
-      resume_filepath: file,
-      role,
-      otpCode: otp,
-      otpExpires: otpExpires,
-      lastOtpSent: now,
-      otpAttempts: 1, // First send attempt
-      blockExpires: null
-    };
-    await createPendingSignup({ tempToken, ...signupData }); // Create new pending signup
+  const signupData = {
+    name,
+    email,
+    hashedPassword: await bcrypt.hash(password, 10),
+    resume_filepath: file,
+    role,
+    otpCode: otp,
+    otpExpires: otpExpires,
+    lastOtpSent: now,
+    otpAttempts: 0, // Initial send attempt count for this new pending signup
+    blockExpires: null // No initial block
+  };
+
+  try {
+    await createPendingSignup({ tempToken, ...signupData });
+    console.log("Debug: Sending OTP for new signup.");
     await sendOTP(email, otp);
     res.json({ message: "OTP sent", tempToken });
+  } catch (error) {
+    console.error("Failed to send OTP or save pending signup:", error);
+    return res.status(500).json({ error: "Failed to send OTP or process signup" });
+  }
+};
+
+// Resend Signup OTP Controller
+const resendSignupOTP = async (req, res) => {
+  const { email, tempToken } = req.body;
+
+  if (!validator.isEmail(email)) {
+    return res.status(400).json({ error: "Invalid email" });
+  }
+
+  if (!tempToken) {
+    return res.status(400).json({ error: "Invalid or missing temporary token." });
+  }
+
+  const pendingSignup = await findPendingSignupByToken(tempToken);
+
+  if (!pendingSignup || pendingSignup.email !== email) {
+    return res.status(400).json({ error: "Invalid or expired token, or email mismatch." });
+  }
+
+  const now = Date.now();
+  const OTP_COOLDOWN = 30 * 1000; // 30 seconds
+  const MAX_OTP_SEND_ATTEMPTS = 3; // Max times OTP can be sent for a single signup attempt
+  const SIGNUP_BLOCK_DURATION = 5 * 60 * 1000; // 5 minutes
+
+  // Check if currently blocked for sending OTPs
+  if (pendingSignup.blockExpires && pendingSignup.blockExpires > now) {
+    const remainingMillis = pendingSignup.blockExpires - now;
+    const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
+    return res.status(429).json({ error: `Too many OTP send attempts. Please try again in ${remainingMinutes} minute(s).` });
+  }
+
+  // Check OTP resend cooldown
+  if (pendingSignup.lastOtpSent && (now - pendingSignup.lastOtpSent) < OTP_COOLDOWN) {
+    const remainingSeconds = Math.ceil((OTP_COOLDOWN - (now - pendingSignup.lastOtpSent)) / 1000);
+    return res.status(429).json({ error: `Please wait ${remainingSeconds} second(s) before requesting another OTP.` });
+  }
+
+  // Increment OTP send attempts
+  const newOtpSendAttempts = (pendingSignup.otpAttempts || 0) + 1; // Re-purposing otpAttempts for send attempts
+  let updates = { lastOtpSent: now, otpAttempts: newOtpSendAttempts };
+
+  if (newOtpSendAttempts > MAX_OTP_SEND_ATTEMPTS) {
+    updates.blockExpires = now + SIGNUP_BLOCK_DURATION;
+    const blockDurationMinutes = Math.ceil(SIGNUP_BLOCK_DURATION / (60 * 1000));
+    await updatePendingSignup(pendingSignup.id, updates);
+    return res.status(429).json({ error: `Too many OTP send attempts (${MAX_OTP_SEND_ATTEMPTS}). Account temporarily blocked for sending OTPs. Please try again in ${blockDurationMinutes} minute(s).` });
+  }
+
+  const newOtp = generateOTP();
+  updates.otpCode = newOtp;
+  updates.otpExpires = now + 5 * 60 * 1000; // New OTP valid for 5 minutes
+
+  try {
+    await updatePendingSignup(pendingSignup.id, updates);
+    await sendOTP(email, newOtp);
+    res.json({ message: "New OTP sent successfully!", tempToken });
+  } catch (error) {
+    console.error("Error resending OTP:", error);
+    return res.status(500).json({ error: "Failed to resend OTP." });
   }
 };
 
@@ -596,5 +655,6 @@ module.exports = {
     changePassword,
     requestEmailChange,
     verifyEmailChange,
+    resendSignupOTP,
     // tempUsers // No longer needed, removed from export
 }; 
