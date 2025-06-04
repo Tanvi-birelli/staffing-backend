@@ -1,101 +1,134 @@
 const { loadJSON, saveJSON, updateIds } = require("../utils/fileHelpers");
+const { pool } = require("../config/db");
+const validator = require("validator");
+const { findUserByEmail, updateUser } = require("../utils/dbHelpers");
 
 // HR Profile Management Controllers
-const getProfile = (req, res) => {
-  const users = loadJSON("users.json");
-  const user = users.find(u => u.email === req.user.email);
+const getProfile = async (req, res) => {
+  try {
+    const [users] = await pool.execute(
+      "SELECT id, username, email, role, verified, voat_id FROM users WHERE id = ?",
+      [req.user.id]
+    );
+    const user = users[0];
 
-  if (!user) {
-    return res.status(404).json({ error: "HR profile not found" });
+    if (!user) {
+      return res.status(404).json({ error: "HR profile not found" });
+    }
+
+    // Currently, HR profiles are assumed to be stored primarily in the users table.
+    // If there's a separate 'hr_profiles' table with more fields, it would be joined here.
+    res.json(user);
+  } catch (error) {
+    console.error("Error fetching HR profile:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
-
-  const { password, ...profile } = user;
-  res.json(profile);
 };
 
-const updateProfile = (req, res) => {
-  let users = loadJSON("users.json");
-  const userIndex = users.findIndex(u => u.email === req.user.email);
+const updateProfile = async (req, res) => {
+  try {
+    const { username } = req.body; // Assuming only username is updatable for now
+    const errors = [];
 
-  if (userIndex === -1) {
-    return res.status(404).json({ error: "HR profile not found" });
+    if (username !== undefined && (typeof username !== 'string' || username.trim().length === 0 || username.length > 255)) {
+      errors.push("Username must be a non-empty string and less than 255 characters.");
+    }
+
+    if (errors.length > 0) {
+      return res.status(400).json({ errors });
+    }
+
+    const user = await findUserByEmail(req.user.email);
+
+    if (!user) {
+      return res.status(404).json({ error: "HR profile not found" });
+    }
+
+    // Only update allowed fields
+    const updates = {};
+    if (username !== undefined) {
+      updates.username = username;
+    }
+
+    if (Object.keys(updates).length > 0) {
+      await updateUser(user.id, updates);
+    }
+
+    // Fetch the updated profile to send back in the response
+    const [updatedUsers] = await pool.execute(
+      "SELECT id, username, email, role, verified, voat_id FROM users WHERE id = ?",
+      [req.user.id]
+    );
+    const updatedUser = updatedUsers[0];
+
+    res.json({ message: "HR profile updated successfully", profile: updatedUser });
+  } catch (error) {
+    console.error("Error updating HR profile:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
-
-  const existingUser = users[userIndex];
-
-  // Update allowed fields, preventing sensitive data changes like email or password directly
-  const updatedUser = {
-    ...existingUser,
-    ...req.body,
-    email: existingUser.email, // Prevent email change via profile update
-    password: existingUser.password, // Prevent password change via profile update
-    user_id: existingUser.user_id, // Ensure user_id is not changed
-    // Add other fields that should not be changed here
-  };
-
-  users[userIndex] = updatedUser;
-  saveJSON("users.json", users);
-
-  const { password, ...profile } = updatedUser;
-  res.json({ message: "HR profile updated successfully", profile });
 };
 
 // HR Schedule Controllers
-const getSchedule = (req, res) => {
-  const schedules = loadJSON("schedules.json");
-  // Assuming schedule data is linked to HR by email, similar to jobseekers
-  const hrSchedules = schedules.filter(s => s.hrEmail === req.user.email);
-  res.json(hrSchedules || []);
+const getSchedule = async (req, res) => {
+  try {
+    const [schedules] = await pool.execute(
+      "SELECT * FROM interviews WHERE hr_id = ?", // Assuming hr_id is in interviews table
+      [req.user.id]
+    );
+    res.json(schedules);
+  } catch (error) {
+    console.error("Error fetching HR schedule:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
 };
 
 // HR Notification Controllers
-const getNotifications = (req, res) => {
-  const notifications = loadJSON("notifications.json");
-  const { date } = req.query; // Get the date query parameter
+const getNotifications = async (req, res) => {
+  try {
+    const { date } = req.query;
+    let query = "SELECT * FROM notifications WHERE user_id = ? AND role = 'hr'";
+    const params = [req.user.id];
 
-  let hrNotifications = notifications.filter(n => n.email === req.user.email && n.role === 'hr'); // Filter by HR email and role
-
-  // If a date is provided, filter by date
-  if (date) {
-    hrNotifications = hrNotifications.filter(notif => {
-      // Assuming notification objects have a 'createdAt' timestamp
-      const notificationDate = new Date(notif.createdAt).toISOString().split('T')[0];
-      return notificationDate === date;
-    });
-  }
-
-  res.json(hrNotifications || []);
-};
-
-const markNotificationRead = (req, res) => {
-  let notifications = loadJSON("notifications.json");
-  const notificationId = parseInt(req.params.id, 10);
-
-  const notification = notifications.find(n => n.id === notificationId && n.hrEmail === req.user.email);
-
-  if (!notification) return res.status(404).json({ error: "Notification not found or does not belong to this HR" });
-
-  notification.read = true;
-
-  saveJSON("notifications.json", notifications);
-
-  res.json({ message: "Notification marked as read" });
-};
-
-const markAllNotificationsRead = (req, res) => {
-  let notifications = loadJSON("notifications.json");
-  const updatedNotifications = notifications.map(notif => {
-    // Assuming notifications are linked to HR by email
-    if (notif.hrEmail === req.user.email) {
-      return { ...notif, read: true };
-    } else {
-      return notif;
+    if (date) {
+      query += " AND DATE(created_at) = ?";
+      params.push(date);
     }
-  });
 
-  saveJSON("notifications.json", updatedNotifications);
+    const [notifications] = await pool.execute(query, params);
+    res.json(notifications);
+  } catch (error) {
+    console.error("Error fetching HR notifications:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
 
-  res.json({ message: "All notifications marked as read" });
+const markNotificationRead = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [result] = await pool.execute(
+      "UPDATE notifications SET is_read = TRUE WHERE notification_id = ? AND user_id = ? AND role = 'hr'",
+      [id, req.user.id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Notification not found or does not belong to this HR" });
+    }
+
+    res.json({ message: "Notification marked as read" });
+  } catch (error) {
+    console.error("Error marking notification as read:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+const markAllNotificationsRead = async (req, res) => {
+  try {
+    await pool.execute("UPDATE notifications SET is_read = TRUE WHERE user_id = ? AND role = 'hr'", [req.user.id]);
+    res.json({ message: "All notifications marked as read" });
+  } catch (error) {
+    console.error("Error marking all notifications as read:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
 };
 
 // HR Application Management & Interview Scheduling Controllers

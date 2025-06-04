@@ -2,12 +2,11 @@ const bcrypt = require("bcryptjs");
 const validator = require("validator");
 const jwt = require("jsonwebtoken");
 const { v4: uuidv4 } = require("uuid");
-const { loadUsers, saveUsers, updateIds, loadJSON, saveJSON } = require("../utils/fileHelpers");
 const { generateOTP, sendOTP, sendPasswordResetEmail, generateToken, sendEmailVerificationEmail } = require("../utils/otpHelpers");
 const validatePassword = require("../utils/passwordHelpers");
 const crypto = require('crypto'); // Import crypto for token generation
 const { findUserByEmail, createUser, updateUser, findUserByResetToken, findUserByVerificationToken, createPendingSignup, findPendingSignupByEmail, updatePendingSignup, deletePendingSignup, findPendingSignupByToken } = require("../utils/dbHelpers");
-const { pool } = require("../utils/dbHelpers");
+const { pool } = require("../config/db");
 
 // const tempUsers = {}; // This will be replaced by pending_signups table
 
@@ -40,12 +39,12 @@ const signup = async (req, res) => {
 
   const existingUser = await findUserByEmail(email);
   if (existingUser) {
-    return res.status(400).json({ error: "Account already exists" });
+    // Ambiguous response to prevent email enumeration for existing, verified users
+    return res.json({ message: "If an account with that email exists, please proceed to login or password reset." });
   }
 
   let pendingSignup = await findPendingSignupByEmail(email);
   const now = Date.now();
-  const OTP_COOLDOWN = 30 * 1000; // 30 seconds
   const SIGNUP_BLOCK_DURATION = 5 * 60 * 1000; // 5 minutes
 
   if (pendingSignup) {
@@ -55,14 +54,15 @@ const signup = async (req, res) => {
       const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
       return res.status(429).json({ error: `Too many signup attempts. Please try again in ${remainingMinutes} minute(s).` });
     }
-    // Check OTP resend cooldown
-    if (pendingSignup.lastOtpSent && (now - pendingSignup.lastOtpSent) < OTP_COOLDOWN) {
-      const remainingSeconds = Math.ceil((OTP_COOLDOWN - (now - pendingSignup.lastOtpSent)) / 1000);
-      console.log(`Debug: Cooldown active. Remaining seconds: ${remainingSeconds}`); // Debugging line
-      return res.status(429).json({ error: `Please wait ${remainingSeconds} second(s) before requesting another OTP.` });
-    }
+
+    // If pending signup exists and not blocked, direct to resend OTP endpoint
+    return res.status(409).json({
+        message: "A pending signup already exists for this email. Please verify OTP or use the resend OTP endpoint.",
+        tempToken: pendingSignup.tempToken // Provide the existing tempToken
+    });
   }
 
+  // If no existing user and no pending signup, proceed with new signup process
   const otp = generateOTP();
   const tempToken = uuidv4();
   const otpExpires = now + 5 * 60 * 1000; // OTP valid for 5 minutes
@@ -76,17 +76,13 @@ const signup = async (req, res) => {
     otpCode: otp,
     otpExpires: otpExpires,
     lastOtpSent: now,
-    otpAttempts: 0,
-    blockExpires: null // Reset block for new attempt
+    otpAttempts: 0, // Initial send attempt count for this new pending signup
+    blockExpires: null // No initial block
   };
 
   try {
-    if (pendingSignup) {
-      await updatePendingSignup(pendingSignup.id, { tempToken, ...signupData }); // Update existing pending signup with new tempToken
-    } else {
-      await createPendingSignup({ tempToken, ...signupData }); // Create new pending signup
-    }
-    console.log("Debug: Sending OTP."); // Debugging line
+    await createPendingSignup({ tempToken, ...signupData });
+    console.log("Debug: Sending OTP for new signup.");
     await sendOTP(email, otp);
     res.json({ message: "OTP sent", tempToken });
   } catch (error) {
@@ -105,7 +101,8 @@ const loginPassword = async (req, res) => {
 
   const user = await findUserByEmail(email);
 
-  if (!user) return res.status(400).json({ error: "Account not found" });
+  // Ambiguous response to prevent user enumeration
+  if (!user) return res.status(400).json({ error: "Invalid credentials." });
 
   const now = Date.now();
   const GLOBAL_LOGIN_ATTEMPTS_LIMIT = 5;
@@ -169,7 +166,8 @@ const requestLoginOTP = async (req, res) => {
 
   const user = await findUserByEmail(email);
 
-  if (!user) return res.status(400).json({ error: "Account not found" });
+  // Ambiguous response to prevent user enumeration
+  if (!user) return res.json({ message: "If an account with that email exists, an OTP has been sent." });
 
   const now = Date.now();
   const OTP_COOLDOWN = 30 * 1000; // 30 seconds
@@ -520,17 +518,18 @@ const requestEmailChange = async (req, res) => {
   if (!validator.isEmail(oldEmail) || !validator.isEmail(newEmail)) {
     return res.status(400).json({ error: "Invalid email format" });
   }
+  if (oldEmail === newEmail) {
+    return res.status(400).json({ error: "New email cannot be the same as the old email." });
+  }
 
   const user = await findUserByEmail(oldEmail);
-  // Security Best Practice: Respond generically if old email not found
   if (!user) {
-    console.log(`Email change requested for non-existent old email: ${oldEmail}`);
-    return res.status(400).json({ error: "Invalid request or account not found." }); // Generic error
+    return res.status(400).json({ error: "Account not found with provided old email." });
   }
 
   const existingNewEmailUser = await findUserByEmail(newEmail);
   if (existingNewEmailUser) {
-    return res.status(400).json({ error: "New email is already in use" });
+    return res.status(400).json({ error: "New email is already in use by another account." });
   }
 
   const verificationToken = generateToken();
@@ -538,14 +537,15 @@ const requestEmailChange = async (req, res) => {
 
   try {
     await updateUser(user.id, { newEmail: newEmail, verificationToken: verificationToken, verificationExpires: verificationExpires });
-    await sendEmailVerificationEmail(newEmail, verificationToken);
-    res.json({ message: "Verification email sent to new email (if account exists)." }); // Generic success message
+    await sendEmailVerificationEmail(newEmail, verificationToken, "email_change");
+    res.json({ message: "Verification link sent to new email address." });
   } catch (error) {
     console.error("Request Email Change Error:", error);
-    return res.status(500).json({ error: "Failed to send verification email." }); // Generic error
+    res.status(500).json({ error: "Failed to request email change." });
   }
 };
 
+// Verify Email Change Controller
 const verifyEmailChange = async (req, res) => {
   const { token } = req.query;
 
@@ -555,47 +555,36 @@ const verifyEmailChange = async (req, res) => {
 
   const userToVerify = await findUserByVerificationToken(token);
 
-  if (!userToVerify || !userToVerify.newEmail) {
-    return res.status(400).json({ error: "Invalid or expired verification token, or no pending email change." });
-  }
-
-  // Check if the token has expired (though findUserByVerificationToken already does this for reset/signup)
-  // For email change, it's tied to 'newEmail' which might not have 'verificationExpires' directly linked to it in the same way as `verificationToken` column.
-  // Re-checking the general `verificationExpires` on the user object is good.
-  if (userToVerify.verificationExpires < Date.now()) {
-    await updateUser(userToVerify.id, { newEmail: null, verificationToken: null, verificationExpires: null });
-    return res.status(400).json({ error: "Verification token has expired. Please request a new email change." });
+  if (!userToVerify || !userToVerify.newEmail || userToVerify.verificationExpires < Date.now()) {
+    return res.status(400).json({ error: "Invalid or expired verification token for email change." });
   }
 
   try {
-    // Update the primary email and clear pending change fields
     await updateUser(userToVerify.id, {
-      email: userToVerify.newEmail, // Set new email as primary
+      email: userToVerify.newEmail,
       newEmail: null,
       verificationToken: null,
       verificationExpires: null,
     });
-    res.json({ message: "Email address updated successfully" });
+    res.json({ message: "Email changed successfully." });
   } catch (error) {
-    console.error("Email Change Verification Error:", error);
-    res.status(500).json({ error: "Failed to verify and update email address." });
+    console.error("Verify Email Change Error:", error);
+    res.status(500).json({ error: "Failed to verify email change." });
   }
 };
 
-// Keep tempUsers in this file for now, or consider a more robust temporary storage
-// Need padNumber function for verifyOTP signup case - assuming it's a helper
 const padNumber = (num, length = 3) => String(num).padStart(length, "0");
 
 module.exports = {
-    signup,
-    loginPassword,
-    requestLoginOTP,
-    verifyOTP,
-    requestPasswordReset,
-    resetPassword,
-    verifyEmail,
-    changePassword,
-    requestEmailChange,
-    verifyEmailChange,
-    // tempUsers // No longer needed, removed from export
+  signup,
+  loginPassword,
+  requestLoginOTP,
+  verifyOTP,
+  requestPasswordReset,
+  resetPassword,
+  verifyEmail,
+  changePassword,
+  requestEmailChange,
+  verifyEmailChange,
+  // tempUsers // No longer needed, removed from export
 }; 
