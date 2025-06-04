@@ -56,7 +56,7 @@ app.use('/api', contactRoutes);
 app.use('/api', announcementRoutes);
 app.use('/api', adminRoutes);
 app.use('/api', hrRoutes);
-app.use('/api', jobseekerRoutes);
+app.use('/api/jobseeker', jobseekerRoutes);
 
 
 app.listen(PORT, () => {
