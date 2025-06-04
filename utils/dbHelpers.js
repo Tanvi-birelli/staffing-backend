@@ -38,7 +38,7 @@ async function createUser(userData) {
 
     if (role === 'jobseeker') {
         await pool.execute(
-            'INSERT INTO jobseeker_profiles (user_id, resume_filepath) VALUES (?, ?)',
+            'INSERT INTO jobseeker (user_id, resume_filepath) VALUES (?, ?)',
             [userId, resume_filepath]
         );
     }
