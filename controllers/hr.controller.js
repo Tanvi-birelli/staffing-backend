@@ -11,9 +11,9 @@ const getProfile = async (req, res) => {
     );
     const user = users[0];
 
-    if (!user) {
-      return res.status(404).json({ error: "HR profile not found" });
-    }
+  if (!user) {
+    return res.status(404).json({ error: "HR profile not found" });
+  }
 
     // HR profiles are assumed to be stored primarily in the users table.
     res.json(user);
@@ -43,8 +43,8 @@ const updateProfile = async (req, res) => {
     const user = await findUserByEmail(req.user.email);
 
     if (!user) {
-      return res.status(404).json({ error: "HR profile not found" });
-    }
+    return res.status(404).json({ error: "HR profile not found" });
+  }
 
     const updates = {};
     if (username !== undefined) {
@@ -92,7 +92,7 @@ const getNotifications = async (req, res) => {
     let query = "SELECT * FROM notifications WHERE user_id = ? AND role = 'hr'";
     const params = [req.user.id];
 
-    if (date) {
+  if (date) {
       query += " AND DATE(created_at) = ?";
       params.push(date);
     }
@@ -117,7 +117,7 @@ const markNotificationRead = async (req, res) => {
       return res.status(404).json({ error: "Notification not found or does not belong to this HR" });
     }
 
-    res.json({ message: "Notification marked as read" });
+  res.json({ message: "Notification marked as read" });
   } catch (error) {
     console.error("Error marking notification as read:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -156,8 +156,8 @@ const scheduleInterview = async (req, res) => {
     const application = applications[0];
 
     if (!application) {
-      return res.status(404).json({ error: "Application not found" });
-    }
+    return res.status(404).json({ error: "Application not found" });
+  }
 
     // Check if HR user is authorized to schedule for this job (e.g., if job belongs to this HR)
     // This requires a `hr_id` in the `jobs` table or a job-hr association table.
@@ -168,7 +168,7 @@ const scheduleInterview = async (req, res) => {
     if (!hrUser[0] || !jobseekerUser[0]) {
       console.error("User data not found for scheduling interview.", { hrId: req.user.id, jobseekerId: application.jobseeker_id });
       return res.status(500).json({ error: "Internal server error: User data missing." });
-    }
+  }
 
     // 2. Insert into interviews table
     const [interviewResult] = await pool.execute(

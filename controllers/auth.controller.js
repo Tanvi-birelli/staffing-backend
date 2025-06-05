@@ -6,16 +6,22 @@ const { loadUsers, saveUsers, updateIds, loadJSON, saveJSON } = require("../util
 const { generateOTP, sendOTP, sendPasswordResetEmail, generateToken, sendEmailVerificationEmail } = require("../utils/otpHelpers");
 const validatePassword = require("../utils/passwordHelpers");
 const crypto = require('crypto'); // Import crypto for token generation
-const { findUserByEmail, createUser, updateUser, findUserByResetToken, findUserByVerificationToken, createPendingSignup, findPendingSignupByEmail, updatePendingSignup, deletePendingSignup, findPendingSignupByToken } = require("../utils/dbHelpers");
+const { findUserByEmail, createUser, updateUser, findUserByResetToken, findUserByVerificationToken, createPendingSignup, findPendingSignupByEmail, updatePendingSignup, deletePendingSignup, findPendingSignupByToken, findMaxVoatIdSuffix } = require("../utils/dbHelpers");
 const { pool } = require("../utils/dbHelpers");
 
 // const tempUsers = {}; // This will be replaced by pending_signups table
 
 // Signup Controller
 const signup = async (req, res) => {
+  
   const { name, email, password, role } = req.body;
   const file = role === "jobseeker" ? req.file?.filename : null;
-
+  //console.log("name:", name);
+  //console.log("email:", email);
+  //console.log("password:", password);
+  //console.log("role:", role);
+  //console.log("file:", file);
+  
   if (!name || name.trim() === "") {
     return res.status(400).json({ error: "Invalid name" });
   }
@@ -57,7 +63,7 @@ const signup = async (req, res) => {
     }
 
     // If pending signup exists and not blocked, direct to resend OTP endpoint
-    return res.status(409).json({
+    return res.status(200).json({
         message: "A pending signup already exists for this email. Please verify OTP or use the resend OTP endpoint.",
         tempToken: pendingSignup.tempToken // Provide the existing tempToken
     });
@@ -156,6 +162,10 @@ const resendSignupOTP = async (req, res) => {
 // Login with Password Controller
 const loginPassword = async (req, res) => {
   const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required." });
+  }
 
   if (!validator.isEmail(email)) {
     return res.status(400).json({ error: "Invalid email" });
@@ -329,28 +339,33 @@ const verifyOTP = async (req, res) => {
     // OTP correct - add user to permanent store
     try {
       // Generate VOAT ID
-      const allUsers = await findUserByEmail(null); // Get all users to find next available VOAT ID suffix
-      let nextVoatIdSuffix = 0;
-      if (allUsers && allUsers.length > 0) {
-          const voatIds = allUsers.map(user => user.voat_id).filter(Boolean).map(voatId => parseInt(voatId.split('-')[1]));
-          nextVoatIdSuffix = voatIds.length > 0 ? Math.max(...voatIds) + 1 : 1;
-      } else {
-          nextVoatIdSuffix = 1;
-      }
+      let nextVoatIdSuffix = await findMaxVoatIdSuffix();
+      nextVoatIdSuffix += 1;
       const voatId = `VOAT-${String(nextVoatIdSuffix).padStart(3, '0')}`;
 
-      await createUser({
+      const createdUserResult = await createUser({
         username: pendingSignup.name,
         email: pendingSignup.email,
         hashedPassword: pendingSignup.hashedPassword,
         role: pendingSignup.role,
         voatId: voatId,
-      verified: true,
+        verified: true,
         resume_filepath: pendingSignup.resume_filepath
       });
 
       await deletePendingSignup(pendingSignup.id);
-      res.json({ message: "Signup verified successfully" });
+      // Generate JWT token for the newly created user
+      const jwtToken = jwt.sign(
+        { id: createdUserResult.id, email: pendingSignup.email, role: pendingSignup.role },
+        process.env.JWT_SECRET,
+        { expiresIn: "1h" }
+      );
+
+      res.json({
+        message: "Signup verified successfully",
+        token: jwtToken,
+        data: { email: pendingSignup.email, role: pendingSignup.role, name: pendingSignup.name, id: createdUserResult.id }
+      });
     } catch (error) {
       console.error("Error creating user in DB during signup verification:", error);
       return res.status(500).json({ error: "Failed to verify OTP and create user" });
@@ -532,10 +547,12 @@ const verifyEmail = async (req, res) => {
 
 // Secure Password Change Controller
 const changePassword = async (req, res) => {
-  const { email, oldPassword, newPassword } = req.body;
+  const { oldPassword, newPassword } = req.body;
 
-  if (!validator.isEmail(email)) {
-    return res.status(400).json({ error: "Invalid email" });
+  const user = req.user; // Get user from authenticated JWT payload
+
+  if (!user) {
+    return res.status(401).json({ error: "Unauthorized: User not found in token." }); // Should ideally not happen if auth middleware works
   }
 
   const passwordErrors = validatePassword(newPassword);
@@ -544,11 +561,6 @@ const changePassword = async (req, res) => {
       error: "New password does not meet the requirements:",
       details: passwordErrors
     });
-  }
-
-  const user = await findUserByEmail(email);
-  if (!user) {
-    return res.status(400).json({ error: "Account not found" });
   }
 
   if (!(await bcrypt.compare(oldPassword, user.password))) {
@@ -644,6 +656,58 @@ const verifyEmailChange = async (req, res) => {
 // Need padNumber function for verifyOTP signup case - assuming it's a helper
 const padNumber = (num, length = 3) => String(num).padStart(length, "0");
 
+// Get Auth Status
+const getAuthStatus = async (req, res) => {
+  const { email } = req.query; // Expect email as a query parameter
+
+  if (!validator.isEmail(email)) {
+    return res.status(400).json({ error: "Invalid email" });
+  }
+
+  const pendingSignup = await findPendingSignupByEmail(email);
+  const now = Date.now();
+
+  let status = {
+    attemptsLeft: 3, // Default for signup OTP send attempts (from MAX_OTP_SEND_ATTEMPTS)
+    cooldown: 0, // In seconds
+    blocked: false,
+    blockExpires: 0,
+    message: "Ready to send OTP"
+  };
+
+  if (pendingSignup) {
+    const OTP_COOLDOWN = 30 * 1000; // 30 seconds
+    const MAX_OTP_SEND_ATTEMPTS = 3; // Max times OTP can be sent for a single signup attempt
+    const SIGNUP_BLOCK_DURATION = 5 * 60 * 1000; // 5 minutes
+
+    if (pendingSignup.blockExpires && pendingSignup.blockExpires > now) {
+      status.blocked = true;
+      status.blockExpires = pendingSignup.blockExpires;
+      const remainingMillis = pendingSignup.blockExpires - now;
+      const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
+      status.message = `Too many OTP send attempts. Please try again in ${remainingMinutes} minute(s).`;
+    } else if (pendingSignup.lastOtpSent && (now - pendingSignup.lastOtpSent) < OTP_COOLDOWN) {
+      const remainingSeconds = Math.ceil((OTP_COOLDOWN - (now - pendingSignup.lastOtpSent)) / 1000);
+      status.cooldown = remainingSeconds;
+      status.message = `Please wait ${remainingSeconds} second(s) before requesting another OTP.`;
+    } else {
+        // Calculate remaining attempts
+        status.attemptsLeft = MAX_OTP_SEND_ATTEMPTS - (pendingSignup.otpAttempts || 0);
+        if (status.attemptsLeft < 0) status.attemptsLeft = 0; // Should not happen if blocking is working
+        status.message = "Ready to send OTP";
+    }
+
+    // If a pending signup exists, but no block or cooldown, update attemptsLeft
+    if (!status.blocked && status.cooldown === 0) {
+        status.attemptsLeft = MAX_OTP_SEND_ATTEMPTS - (pendingSignup.otpAttempts || 0);
+        if (status.attemptsLeft < 0) status.attemptsLeft = 0;
+    }
+
+  }
+
+  res.json(status);
+};
+
 module.exports = {
     signup,
     loginPassword,
@@ -656,5 +720,5 @@ module.exports = {
     requestEmailChange,
     verifyEmailChange,
     resendSignupOTP,
-    // tempUsers // No longer needed, removed from export
+    getAuthStatus
 }; 

@@ -3,6 +3,7 @@ const validator = require("validator");
 const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
+const { findJobseekerProfileByUserId, updateJobseekerResumePath, updateJobseekerProfile } = require("../utils/dbHelpers");
 
 // Configure multer storage
 const storage = multer.diskStorage({
@@ -34,45 +35,11 @@ const upload = multer({
 // GET /jobseeker/api/profile
 const getProfile = async (req, res) => {
   try {
-    const [users] = await pool.execute(
-      "SELECT id, username, email, role, verified, voat_id, name, phone, gender, address, whatsapp FROM users WHERE id = ?",
-      [req.user.id]
-    );
-    const user = users[0];
+    const profile = await findJobseekerProfileByUserId(req.user.id);
 
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
+    if (!profile) {
+      return res.status(404).json({ error: "Jobseeker profile not found." });
     }
-
-    const [jobseekers] = await pool.execute(
-      "SELECT bio, portfolio, education, experience_years, skills, projects, certifications, resume_filepath, parent_name, parent_phone, parent_relation, parent_email FROM jobseeker WHERE user_id = ?",
-      [req.user.id]
-    );
-    const jobseeker = jobseekers[0];
-
-    const profile = {
-      jobseekerId: user.id,
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
-      gender: user.gender,
-      address: user.address,
-      skills: jobseeker && jobseeker.skills ? jobseeker.skills.split(',').map(s => s.trim()) : [],
-      whatsapp: user.whatsapp,
-      parentDetails: {
-        name: jobseeker ? jobseeker.parent_name : null,
-        phone: jobseeker ? jobseeker.parent_phone : null,
-        relation: jobseeker ? jobseeker.parent_relation : null,
-        email: jobseeker ? jobseeker.parent_email : null,
-      },
-      resumeUrl: jobseeker ? jobseeker.resume_filepath : null,
-      bio: jobseeker ? jobseeker.bio : null,
-      portfolio: jobseeker ? jobseeker.portfolio : null,
-      education: jobseeker ? jobseeker.education : null,
-      experience_years: jobseeker ? jobseeker.experience_years : null,
-      projects: jobseeker && jobseeker.projects ? JSON.parse(jobseeker.projects) : null,
-      certifications: jobseeker && jobseeker.certifications ? JSON.parse(jobseeker.certifications) : null,
-    };
 
     res.json(profile);
   } catch (error) {
@@ -90,11 +57,8 @@ const uploadResume = async (req, res) => {
 
     const resume_filepath = `/uploads/resumes/${req.file.filename}`;
 
-    // Update the jobseeker's resume_filepath in the database
-    await pool.execute(
-      "UPDATE jobseeker SET resume_filepath = ? WHERE user_id = ?",
-      [resume_filepath, req.user.id]
-    );
+    // Update the jobseeker's resume_filepath in the database using the helper
+    await updateJobseekerResumePath(req.user.id, resume_filepath);
 
     res.json({ message: "Resume uploaded successfully.", resumeUrl: resume_filepath });
   } catch (error) {
@@ -145,228 +109,88 @@ const getResume = async (req, res) => {
 // PUT /jobseeker/api/profile
 const updateProfile = async (req, res) => {
   try {
-    const {
-      name, phone, gender, address, whatsapp,
-      parentDetails,
-      bio, portfolio, education, experience_years, skills, projects, certifications, resume_filepath
-    } = req.body;
+    const userId = req.user.id;
+    const profileUpdates = req.body;
 
     const errors = [];
 
-    // --- Validation for user fields (excluding parentDetails) ---
-    if (name !== undefined && (typeof name !== 'string' || name.length > 255)) {
+    // Input validation (simplified, as dbHelper handles data distribution)
+    if (profileUpdates.name !== undefined && (typeof profileUpdates.name !== 'string' || profileUpdates.name.length > 255)) {
       errors.push("Name must be a string and less than 255 characters.");
     }
-    if (phone !== undefined && (typeof phone !== 'string' || !validator.isMobilePhone(phone, 'any'))) {
+    if (profileUpdates.phone !== undefined && (typeof profileUpdates.phone !== 'string' || !validator.isMobilePhone(profileUpdates.phone, 'any'))) {
       errors.push("Phone must be a valid mobile number.");
     }
-    if (gender !== undefined && (typeof gender !== 'string' || !['Male', 'Female', 'Other'].includes(gender))) {
-      errors.push("Gender must be 'Male', 'Female', or 'Other'.");
+    if (profileUpdates.gender !== undefined && (typeof profileUpdates.gender !== 'string' || !['Male', 'Female', 'Other', 'Prefer not to say'].includes(profileUpdates.gender))) {
+      errors.push("Gender must be 'Male', 'Female', 'Other', or 'Prefer not to say'.");
     }
-    if (address !== undefined && (typeof address !== 'string' || address.length > 1000)) {
+    if (profileUpdates.address !== undefined && (typeof profileUpdates.address !== 'string' || profileUpdates.address.length > 1000)) {
       errors.push("Address must be a string and less than 1000 characters.");
     }
-    if (whatsapp !== undefined && (typeof whatsapp !== 'string' || !validator.isMobilePhone(whatsapp, 'any'))) {
+    if (profileUpdates.whatsapp !== undefined && (typeof profileUpdates.whatsapp !== 'string' || !validator.isMobilePhone(profileUpdates.whatsapp, 'any'))) {
       errors.push("Whatsapp must be a valid mobile number.");
     }
-
-    // --- Validation for parentDetails (now in jobseeker table) ---
-    let parentName = null;
-    let parentPhone = null;
-    let parentRelation = null;
-    let parentEmail = null;
-
-    if (parentDetails !== undefined) {
-      if (typeof parentDetails !== 'object' || parentDetails === null) {
-        errors.push("Parent details must be an object.");
-      } else {
-        if (parentDetails.name !== undefined) {
-          if (typeof parentDetails.name !== 'string' || parentDetails.name.length > 255) {
-            errors.push("Parent name must be a string and less than 255 characters.");
-          }
-          parentName = parentDetails.name;
-        }
-        if (parentDetails.phone !== undefined) {
-          if (typeof parentDetails.phone !== 'string' || !validator.isMobilePhone(parentDetails.phone, 'any')) {
-            errors.push("Parent phone must be a valid mobile number.");
-          }
-          parentPhone = parentDetails.phone;
-        }
-        if (parentDetails.relation !== undefined) {
-          if (typeof parentDetails.relation !== 'string' || parentDetails.relation.length > 50) {
-            errors.push("Parent relation must be a string and less than 50 characters.");
-          }
-          parentRelation = parentDetails.relation;
-        }
-        if (parentDetails.email !== undefined) {
-          if (typeof parentDetails.email !== 'string' || !validator.isEmail(parentDetails.email)) {
-            errors.push("Parent email must be a valid email address.");
-          }
-          parentEmail = parentDetails.email;
-        }
-      }
-    }
-
-    if (bio !== undefined && (typeof bio !== 'string' || bio.length > 1000)) {
+    if (profileUpdates.bio !== undefined && (typeof profileUpdates.bio !== 'string' || profileUpdates.bio.length > 1000)) {
       errors.push("Bio must be a string and less than 1000 characters.");
     }
-    if (portfolio !== undefined && (typeof portfolio !== 'string' || !validator.isURL(portfolio) || portfolio.length > 255)) {
-      errors.push("Portfolio must be a valid URL and less than 255 characters.");
+    if (profileUpdates.portfolio !== undefined && (typeof profileUpdates.portfolio !== 'string' || !validator.isURL(profileUpdates.portfolio) || profileUpdates.portfolio.length > 500)) {
+      errors.push("Portfolio must be a valid URL and less than 500 characters.");
     }
-    if (education !== undefined && (typeof education !== 'string' || education.length > 1000)) {
+    if (profileUpdates.education !== undefined && (typeof profileUpdates.education !== 'string' || profileUpdates.education.length > 1000)) {
       errors.push("Education must be a string and less than 1000 characters.");
     }
-    if (experience_years !== undefined && (typeof experience_years !== 'number' || experience_years < 0 || experience_years > 99)) {
+    if (profileUpdates.experience_years !== undefined && (typeof profileUpdates.experience_years !== 'number' || profileUpdates.experience_years < 0 || profileUpdates.experience_years > 99)) {
       errors.push("Experience years must be a non-negative number and less than 100.");
     }
 
-    let skillsToStore = null;
-    if (skills !== undefined) {
-      if (!Array.isArray(skills)) {
-        errors.push("Skills must be an array of strings.");
-      } else {
-        if (skills.some(s => typeof s !== 'string' || s.length > 50)) {
-          errors.push("Each skill in the array must be a string and less than 50 characters.");
-        }
-        skillsToStore = skills.join(', ');
-        if (skillsToStore.length > 500) {
-          errors.push("Combined skills string exceeds 500 characters.");
-        }
+    // Validation for JSON fields (skills, projects, certifications)
+    if (profileUpdates.skills !== undefined) {
+      if (!Array.isArray(profileUpdates.skills) || profileUpdates.skills.some(s => typeof s !== 'string' || s.length > 50)) {
+        errors.push("Skills must be an array of strings, each less than 50 characters.");
+      }
+    }
+    if (profileUpdates.projects !== undefined) {
+      if (!Array.isArray(profileUpdates.projects) || profileUpdates.projects.some(p => typeof p !== 'object' || p === null || !p.title || typeof p.title !== 'string' || p.title.length > 255)) {
+        errors.push("Projects must be an array of objects with a title (string, max 255 chars).");
+      }
+    }
+    if (profileUpdates.certifications !== undefined) {
+      if (!Array.isArray(profileUpdates.certifications) || profileUpdates.certifications.some(c => typeof c !== 'object' || c === null || !c.name || typeof c.name !== 'string' || c.name.length > 255)) {
+        errors.push("Certifications must be an array of objects with a name (string, max 255 chars).");
       }
     }
 
-    let parsedProjects = null;
-    if (projects !== undefined) {
-      if (typeof projects === 'string') {
-        try {
-          parsedProjects = JSON.parse(projects);
-        } catch (e) {
-          errors.push("Projects must be a valid JSON string.");
+    // Validation for parentDetails object
+    if (profileUpdates.parentDetails !== undefined) {
+        if (typeof profileUpdates.parentDetails !== 'object' || profileUpdates.parentDetails === null) {
+            errors.push("Parent details must be an object.");
+        } else {
+            if (profileUpdates.parentDetails.name !== undefined && (typeof profileUpdates.parentDetails.name !== 'string' || profileUpdates.parentDetails.name.length > 255)) {
+                errors.push("Parent name must be a string and less than 255 characters.");
+            }
+            if (profileUpdates.parentDetails.phone !== undefined && (typeof profileUpdates.parentDetails.phone !== 'string' || !validator.isMobilePhone(profileUpdates.parentDetails.phone, 'any'))) {
+                errors.push("Parent phone must be a valid mobile number.");
+            }
+            if (profileUpdates.parentDetails.relation !== undefined && (typeof profileUpdates.parentDetails.relation !== 'string' || profileUpdates.parentDetails.relation.length > 50)) {
+                errors.push("Parent relation must be a string and less than 50 characters.");
+            }
+            if (profileUpdates.parentDetails.email !== undefined && (typeof profileUpdates.parentDetails.email !== 'string' || !validator.isEmail(profileUpdates.parentDetails.email))) {
+                errors.push("Parent email must be a valid email address.");
+            }
         }
-      } else if (typeof projects === 'object' && projects !== null) {
-        parsedProjects = projects;
-      } else {
-        errors.push("Projects must be a valid JSON string or object.");
-      }
-    }
-
-    let parsedCertifications = null;
-    if (certifications !== undefined) {
-      if (typeof certifications === 'string') {
-        try {
-          parsedCertifications = JSON.parse(certifications);
-        } catch (e) {
-          errors.push("Certifications must be a valid JSON string.");
-        }
-      } else if (typeof certifications === 'object' && certifications !== null) {
-        parsedCertifications = certifications;
-      } else {
-        errors.push("Certifications must be a valid JSON string or object.");
-      }
-    }
-
-    if (resume_filepath !== undefined && (typeof resume_filepath !== 'string' || resume_filepath.length > 255)) {
-      errors.push("Resume filepath must be a string and less than 255 characters.");
     }
 
     if (errors.length > 0) {
-      return res.status(400).json({ errors: errors.map(msg => ({ message: msg })) });
+      return res.status(400).json({ errors });
     }
 
-    // Update users table (only general user fields)
-    let userUpdateQuery = `UPDATE users SET updated_at = CURRENT_TIMESTAMP`;
-    const userUpdateParams = [];
+    // Pass the updates directly to the helper function
+    await updateJobseekerProfile(userId, profileUpdates);
 
-    if (name !== undefined) { userUpdateQuery += `, name = ?`; userUpdateParams.push(name); }
-    if (phone !== undefined) { userUpdateQuery += `, phone = ?`; userUpdateParams.push(phone); }
-    if (gender !== undefined) { userUpdateQuery += `, gender = ?`; userUpdateParams.push(gender); }
-    if (address !== undefined) { userUpdateQuery += `, address = ?`; userUpdateParams.push(address); }
-    if (whatsapp !== undefined) { userUpdateQuery += `, whatsapp = ?`; userUpdateParams.push(whatsapp); }
-    
-    userUpdateQuery += ` WHERE id = ?`;
-    userUpdateParams.push(req.user.id);
-    
-    if (userUpdateParams.length > 1) { // Only execute if there are fields to update (besides updated_at and id)
-        await pool.execute(userUpdateQuery, userUpdateParams);
-    }
+    // Fetch the updated profile to return the latest state
+    const updatedProfile = await findJobseekerProfileByUserId(userId);
 
-    const [existingJobseekerProfile] = await pool.execute("SELECT user_id FROM jobseeker WHERE user_id = ?", [req.user.id]);
-
-    // Prepare fields for jobseeker table (including parent details)
-    const jobseekerFields = {};
-    if (bio !== undefined) jobseekerFields.bio = bio;
-    if (portfolio !== undefined) jobseekerFields.portfolio = portfolio;
-    if (education !== undefined) jobseekerFields.education = education;
-    if (experience_years !== undefined) jobseekerFields.experience_years = experience_years;
-    if (skillsToStore !== null) jobseekerFields.skills = skillsToStore;
-    if (parsedProjects !== null) jobseekerFields.projects = JSON.stringify(parsedProjects);
-    if (parsedCertifications !== null) jobseekerFields.certifications = JSON.stringify(parsedCertifications);
-    if (resume_filepath !== undefined) jobseekerFields.resume_filepath = resume_filepath;
-    if (parentName !== null) jobseekerFields.parent_name = parentName;
-    if (parentPhone !== null) jobseekerFields.parent_phone = parentPhone;
-    if (parentRelation !== null) jobseekerFields.parent_relation = parentRelation;
-    if (parentEmail !== null) jobseekerFields.parent_email = parentEmail;
-
-    if (existingJobseekerProfile.length === 0) {
-      // If no jobseeker profile exists, insert a new one
-      if (Object.keys(jobseekerFields).length > 0) { // Only insert if there are jobseeker-specific fields to add
-        const columns = Object.keys(jobseekerFields);
-        const values = Object.values(jobseekerFields);
-        await pool.execute(
-          `INSERT INTO jobseeker (user_id, ${columns.join(', ')}) VALUES (?, ${columns.map(() => '?').join(', ')})`,
-          [req.user.id, ...values]
-        );
-      }
-    } else {
-      // If jobseeker profile exists, update it
-      if (Object.keys(jobseekerFields).length > 0) { // Only update if there are jobseeker-specific fields
-        const setClauses = Object.keys(jobseekerFields).map(key => `${key} = ?`).join(', ');
-        const updateValues = Object.values(jobseekerFields);
-        await pool.execute(
-          `UPDATE jobseeker SET ${setClauses} WHERE user_id = ?`,
-          [...updateValues, req.user.id]
-        );
-      }
-    }
-
-    // Fetch the updated profile to send back in the response (re-using getProfile logic to ensure consistency)
-    const [updatedUsersResult] = await pool.execute(
-      "SELECT id, username, email, role, verified, voat_id, name, phone, gender, address, whatsapp FROM users WHERE id = ?",
-      [req.user.id]
-    );
-    const updatedUser = updatedUsersResult[0];
-
-    const [updatedJobseekersResult] = await pool.execute(
-      "SELECT bio, portfolio, education, experience_years, skills, projects, certifications, resume_filepath, parent_name, parent_phone, parent_relation, parent_email FROM jobseeker WHERE user_id = ?",
-      [req.user.id]
-    );
-    const updatedJobseeker = updatedJobseekersResult[0];
-
-    const updatedProfile = {
-      jobseekerId: updatedUser.id,
-      name: updatedUser.name,
-      email: updatedUser.email,
-      phone: updatedUser.phone,
-      gender: updatedUser.gender,
-      address: updatedUser.address,
-      skills: updatedJobseeker && updatedJobseeker.skills ? updatedJobseeker.skills.split(',').map(s => s.trim()) : [],
-      whatsapp: updatedUser.whatsapp,
-      parentDetails: {
-        name: updatedJobseeker ? updatedJobseeker.parent_name : null,
-        phone: updatedJobseeker ? updatedJobseeker.parent_phone : null,
-        relation: updatedJobseeker ? updatedJobseeker.parent_relation : null,
-        email: updatedJobseeker ? updatedJobseeker.parent_email : null,
-      },
-      resumeUrl: updatedJobseeker ? updatedJobseeker.resume_filepath : null,
-      bio: updatedJobseeker ? updatedJobseeker.bio : null,
-      portfolio: updatedJobseeker ? updatedJobseeker.portfolio : null,
-      education: updatedJobseeker ? updatedJobseeker.education : null,
-      experience_years: updatedJobseeker ? updatedJobseeker.experience_years : null,
-      projects: updatedJobseeker && updatedJobseeker.projects ? JSON.parse(updatedJobseeker.projects) : null,
-      certifications: updatedJobseeker && updatedJobseeker.certifications ? JSON.parse(updatedJobseeker.certifications) : null,
-    };
-
-    res.json({ message: "Profile updated successfully", updatedProfile: updatedProfile });
+    res.json({ message: "Profile updated successfully.", profile: updatedProfile });
   } catch (error) {
     console.error("Error updating job seeker profile:", error);
     res.status(500).json({ error: "Internal server error" });

@@ -1,7 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const corsOptions = {
-  origin: "http://localhost:5173", // Vite's default port
+  origin: "http://localhost:5174", // Vite's default port
   credentials: true,
 };
 const dotenv = require("dotenv");
@@ -11,8 +11,6 @@ const { signInOtpLimiter, LoginOtpLimiter } = require("./utils/rateLimiters.js")
 const { generateOTP, sendOTP } = require("./utils/otpHelpers.js");
 const validatePassword = require("./utils/passwordHelpers.js");
 const { upload, imageUpload } = require("./utils/multerConfig.js");
-const authenticateJWT = require("./middleware/auth.middleware.js");
-const authorize = require("./middleware/role.middleware.js");
 const authRoutes = require("./routes/auth.routes.js");
 const contactRoutes = require("./routes/contact.routes.js");
 const announcementRoutes = require("./routes/announcement.routes.js");
@@ -58,6 +56,14 @@ app.use('/api', adminRoutes);
 app.use('/api', hrRoutes);
 app.use('/api/jobseeker', jobseekerRoutes);
 
+// Error Handling Middleware (moved to the end)
+app.use((err, req, res, next) => {
+  if (err.name === 'MulterError') {
+    return res.status(400).json({ error: err.message });
+  }
+  // For production, make this message less specific to avoid leaking details
+  return res.status(500).json({ error: "An unexpected server error occurred." });
+});
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);

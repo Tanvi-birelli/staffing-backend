@@ -149,6 +149,136 @@ async function deletePendingSignup(id) {
     await pool.execute('DELETE FROM pending_signups WHERE id = ?', [id]);
 }
 
+async function findJobseekerProfileByUserId(userId) {
+    const [rows] = await pool.execute(
+        `SELECT
+            u.id AS userId,
+            u.username,
+            u.email,
+            u.role,
+            u.voat_id,
+            u.verified,
+            u.name,
+            u.phone,
+            u.gender,
+            u.address,
+            u.whatsapp,
+            j.resume_filepath,
+            j.bio,
+            j.portfolio,
+            j.education,
+            j.experience_years,
+            j.skills,
+            j.projects,
+            j.certifications,
+            j.parent_name AS parentDetails_name,
+            j.parent_phone AS parentDetails_phone,
+            j.parent_relation AS parentDetails_relation,
+            j.parent_email AS parentDetails_email
+        FROM
+            users u
+        JOIN
+            jobseeker j ON u.id = j.user_id
+        WHERE
+            u.id = ? AND u.role = 'jobseeker'`,
+        [userId]
+    );
+    if (rows.length === 0) return null;
+
+    const profile = rows[0];
+    // Restructure parentDetails for a cleaner API response
+    profile.parentDetails = {
+        name: profile.parentDetails_name,
+        phone: profile.parentDetails_phone,
+        relation: profile.parentDetails_relation,
+        email: profile.parentDetails_email,
+    };
+    delete profile.parentDetails_name;
+    delete profile.parentDetails_phone;
+    delete profile.parentDetails_relation;
+    delete profile.parentDetails_email;
+
+    return profile;
+}
+
+async function updateJobseekerProfile(userId, profileUpdates) {
+    const userUpdates = {};
+    const jobseekerUpdates = {};
+    const parentDetailsUpdates = {};
+
+    // Define which fields belong to which table
+    const userFields = ['name', 'phone', 'gender', 'address', 'whatsapp'];
+    const jobseekerFields = ['bio', 'portfolio', 'education', 'experience_years', 'skills', 'projects', 'certifications'];
+
+    for (const key in profileUpdates) {
+        if (userFields.includes(key)) {
+            userUpdates[key] = profileUpdates[key];
+        } else if (jobseekerFields.includes(key)) {
+            // Convert JSON fields to string if they are arrays/objects
+            if (['skills', 'projects', 'certifications'].includes(key)) {
+                jobseekerUpdates[key] = JSON.stringify(profileUpdates[key]);
+            } else {
+                jobseekerUpdates[key] = profileUpdates[key];
+            }
+        } else if (key === 'parentDetails') {
+            // Handle parentDetails separately
+            parentDetailsUpdates.parent_name = profileUpdates.parentDetails.name;
+            parentDetailsUpdates.parent_phone = profileUpdates.parentDetails.phone;
+            parentDetailsUpdates.parent_relation = profileUpdates.parentDetails.relation;
+            parentDetailsUpdates.parent_email = profileUpdates.parentDetails.email;
+        }
+    }
+
+    // Perform updates only if there are fields to update for each table
+    if (Object.keys(userUpdates).length > 0) {
+        const fields = [];
+        const values = [];
+        for (const key in userUpdates) {
+            fields.push(`\`${key}\` = ?`);
+            values.push(userUpdates[key]);
+        }
+        values.push(userId);
+        await pool.execute(
+            `UPDATE users SET ${fields.join(', ')} WHERE id = ?`,
+            values
+        );
+    }
+
+    const finalJobseekerUpdates = { ...jobseekerUpdates, ...parentDetailsUpdates };
+    if (Object.keys(finalJobseekerUpdates).length > 0) {
+        const fields = [];
+        const values = [];
+        for (const key in finalJobseekerUpdates) {
+            fields.push(`\`${key}\` = ?`);
+            values.push(finalJobseekerUpdates[key]);
+        }
+        values.push(userId);
+        await pool.execute(
+            `UPDATE jobseeker SET ${fields.join(', ')} WHERE user_id = ?`,
+            values
+        );
+    }
+
+    return true; // Indicate success
+}
+
+async function updateJobseekerResumePath(userId, resumePath) {
+    await pool.execute(
+        'UPDATE jobseeker SET resume_filepath = ? WHERE user_id = ?',
+        [resumePath, userId]
+    );
+    return true;
+}
+
+async function findMaxVoatIdSuffix() {
+    // This query extracts the numeric part of the VOAT-ID and finds the maximum.
+    // It assumes VOAT-ID is always in the format 'VOAT-XXX' where XXX is numeric.
+    const [rows] = await pool.execute(
+        `SELECT MAX(CAST(SUBSTRING_INDEX(voat_id, '-', -1) AS UNSIGNED)) AS max_suffix FROM users WHERE voat_id LIKE 'VOAT-%'`
+    );
+    return rows[0].max_suffix || 0; // Return 0 if no VOAT-IDs exist
+}
+
 module.exports = {
     findUserByEmail,
     findUserByResetToken,
@@ -165,5 +295,9 @@ module.exports = {
     findPendingSignupByEmail,
     findPendingSignupByToken,
     updatePendingSignup,
-    deletePendingSignup
+    deletePendingSignup,
+    findJobseekerProfileByUserId,
+    updateJobseekerProfile,
+    updateJobseekerResumePath,
+    findMaxVoatIdSuffix
 }; 
