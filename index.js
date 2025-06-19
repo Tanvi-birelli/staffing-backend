@@ -36,18 +36,33 @@ app.use((err, req, res, next) => {
   if (err.name === 'MulterError') {
     return res.status(400).json({ error: err.message });
   }
-  if (err) {
-    return res.status(500).json({ error: "Internal server error" });
+  // Handle custom file type errors from Multer's fileFilter
+  if (err.message && err.message.startsWith("Invalid file type")) {
+    return res.status(400).json({ error: { code: 400, message: err.message } });
   }
-  next();
+  return res.status(500).json({ error: "An unexpected server error occurred." });
 });
 
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 const uploadDir = path.join(__dirname, "uploads");
 const announcementsDir = path.join(uploadDir, "announcements");
+const resumesDir = path.join(uploadDir, "resumes");
 require("fs").mkdirSync(uploadDir, { recursive: true });
 require("fs").mkdirSync(announcementsDir, { recursive: true });
+require("fs").mkdirSync(resumesDir, { recursive: true });
 
+const fileFilter = (req, file, cb) => {
+  const allowedTypes = [/pdf/, /doc/, /docx/];
+  const isAllowed = allowedTypes.some(regex => regex.test(file.mimetype));
+  if (isAllowed) {
+    cb(null, true);
+  } else {
+    // This ensures the error is handled by Express and not as an uncaught exception
+    process.nextTick(() => {
+      cb(new Error("Invalid file type. Only PDF, DOC, and DOCX files are allowed."));
+    });
+  }
+};
 
 app.use('/api', authRoutes);
 app.use('/api', contactRoutes);
@@ -55,15 +70,6 @@ app.use('/api', announcementRoutes);
 app.use('/api', adminRoutes);
 app.use('/api', hrRoutes);
 app.use('/api/jobseeker', jobseekerRoutes);
-
-// Error Handling Middleware (moved to the end)
-app.use((err, req, res, next) => {
-  if (err.name === 'MulterError') {
-    return res.status(400).json({ error: err.message });
-  }
-  // For production, make this message less specific to avoid leaking details
-  return res.status(500).json({ error: "An unexpected server error occurred." });
-});
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);

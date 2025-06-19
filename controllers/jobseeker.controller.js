@@ -2,35 +2,19 @@ const { pool } = require("../config/db");
 const validator = require("validator");
 const path = require("path");
 const fs = require("fs");
-const multer = require("multer");
-const { findJobseekerProfileByUserId, updateJobseekerResumePath, updateJobseekerProfile } = require("../utils/dbHelpers");
+const { findJobseekerProfileByUserId, updateJobseekerResumePath, updateJobseekerProfile, getJobseekerResumePathByUserId, findJobs, findJobById, findAppliedJobs, checkJobExists, findExistingApplication, createJobApplication, findScheduleByUserId, findNotificationsByUserId, countUnreadNotifications, updateNotificationReadStatus, markAllNotificationsRead: markAllNotificationsReadHelper, deleteNotificationById, findUpcomingNotifications } = require("../utils/dbHelpers");
+const { upload } = require("../utils/multerConfig");
 
-// Configure multer storage
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, "./uploads/resumes");
-  },
-  filename: (req, file, cb) => {
-    cb(null, `${req.user.id}-${Date.now()}${path.extname(file.originalname)}`);
-  },
-});
-
-// Filter for resume file types
-const fileFilter = (req, file, cb) => {
-  const allowedTypes = [/pdf/, /doc/, /docx/];
-  const isAllowed = allowedTypes.some(regex => regex.test(file.mimetype));
-  if (isAllowed) {
-    cb(null, true);
-  } else {
-    cb(new Error("Invalid file type. Only PDF, DOC, and DOCX files are allowed."), false);
+// Multer error handler middleware
+function multerErrorHandler(err, req, res, next) {
+  if (err && err.code === "LIMIT_FILE_SIZE") {
+    return res.status(400).json({ error: { code: 400, message: "File size exceeds limit (5MB)." } });
   }
-};
-
-const upload = multer({
-  storage: storage,
-  fileFilter: fileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
-});
+  if (err && err.message && err.message.startsWith("Invalid file type")) {
+    return res.status(400).json({ error: { code: 400, message: err.message } });
+  }
+  next(err);
+}
 
 // GET /jobseeker/api/profile
 const getProfile = async (req, res) => {
@@ -55,20 +39,28 @@ const uploadResume = async (req, res) => {
       return res.status(400).json({ error: { code: 400, message: "No resume file provided." } });
     }
 
-    const resume_filepath = `/uploads/resumes/${req.file.filename}`;
+    const newResumeFilename = req.file.filename;
+    const newResume_filepath = `/uploads/resumes/${newResumeFilename}`;
 
-    // Update the jobseeker's resume_filepath in the database using the helper
-    await updateJobseekerResumePath(req.user.id, resume_filepath);
+    // Get the old resume path to delete it if it exists
+    const oldResume_filepath = await getJobseekerResumePathByUserId(req.user.id);
 
-    res.json({ message: "Resume uploaded successfully.", resumeUrl: resume_filepath });
+    // Update the jobseeker's resume_filepath in the database
+    await updateJobseekerResumePath(req.user.id, newResume_filepath);
+
+    // If an old resume existed, delete it from the filesystem after successful database update
+    if (oldResume_filepath) {
+      const oldFilePath = path.join(__dirname, "..", oldResume_filepath);
+      if (fs.existsSync(oldFilePath)) {
+        fs.unlink(oldFilePath, (err) => {
+          if (err) console.error("Error deleting old resume file:", err);
+        });
+      }
+    }
+
+    res.json({ message: "Resume uploaded successfully.", resumeUrl: newResume_filepath });
   } catch (error) {
     console.error("Error uploading resume:", error);
-    if (error.message === "Invalid file type. Only PDF, DOC, and DOCX files are allowed.") {
-      return res.status(400).json({ error: { code: 400, message: error.message } });
-    }
-    if (error.code === "LIMIT_FILE_SIZE") {
-      return res.status(400).json({ error: { code: 400, message: "File size exceeds limit (5MB)." } });
-    }
     res.status(500).json({ error: { code: 500, message: "Failed to upload resume. Please try again." } });
   }
 };
@@ -76,23 +68,28 @@ const uploadResume = async (req, res) => {
 // GET /jobseeker/api/profile/resume
 const getResume = async (req, res) => {
   try {
-    const [jobseekers] = await pool.execute(
-      "SELECT resume_filepath FROM jobseeker WHERE user_id = ?",
-      [req.user.id]
-    );
-    const jobseeker = jobseekers[0];
+    const resumeRelativePath = await getJobseekerResumePathByUserId(req.user.id);
+    console.log('Debug: getResume - Retrieved resumeRelativePath from DB:', resumeRelativePath);
 
-    if (!jobseeker || !jobseeker.resume_filepath) {
+    if (!resumeRelativePath) {
+      console.log('Debug: getResume - No resumeRelativePath found for user_id:', req.user.id);
       return res.status(404).json({ error: { code: 404, message: "Resume not found for this jobseeker." } });
     }
 
-    const filePath = path.join(__dirname, "..", jobseeker.resume_filepath);
+    let filePath;
+    const expectedResumeSubdirPath = path.join(__dirname, "..", "uploads", "resumes", path.basename(resumeRelativePath));
+    const oldResumeRootPath = path.join(__dirname, "..", "uploads", path.basename(resumeRelativePath));
 
-    // Check if file exists before sending
-    if (!fs.existsSync(filePath)) {
-      console.error(`Resume file not found: ${filePath}`);
+    if (fs.existsSync(expectedResumeSubdirPath)) {
+      filePath = expectedResumeSubdirPath;
+    } else if (fs.existsSync(oldResumeRootPath)) {
+      filePath = oldResumeRootPath;
+    } else {
+      console.error(`Resume file not found in either expected path: ${expectedResumeSubdirPath} or ${oldResumeRootPath}`);
       return res.status(404).json({ error: { code: 404, message: "Resume file not found on server." } });
     }
+
+    console.log('Debug: getResume - Constructed filePath:', filePath);
 
     res.download(filePath, (err) => {
       if (err) {
@@ -200,68 +197,29 @@ const updateProfile = async (req, res) => {
 // GET /jobseeker/api/jobs
 const getJobs = async (req, res) => {
   try {
-    const { q, experienceLevel, location, datePosted, isUrgent, page = 1, limit = 10 } = req.query;
-    let query = "SELECT * FROM jobs WHERE 1=1";
-    const params = [];
+    let { q, experienceLevel, location, datePosted, isUrgent, page = 1, limit = 10, minSalary, maxSalary, employmentType } = req.query;
 
-    if (q) {
-      const searchTerm = `%${q}%`;
-      query += " AND (title LIKE ? OR company LIKE ? OR description LIKE ?)";
-      params.push(searchTerm, searchTerm, searchTerm);
-    }
-
-    if (experienceLevel) {
-      query += " AND experience_level = ?";
-      params.push(experienceLevel);
-    }
-
-    if (location) {
-      query += " AND location LIKE ?";
-      params.push(`%${location}%`);
-    }
-
-    if (datePosted) {
-      const now = new Date();
-      let dateFilter = null;
-      if (datePosted === "last24hours") {
-        dateFilter = new Date(now.setDate(now.getDate() - 1));
-      } else if (datePosted === "last7days") {
-        dateFilter = new Date(now.setDate(now.getDate() - 7));
-      } else if (datePosted === "last30days") {
-        dateFilter = new Date(now.setDate(now.getDate() - 30));
-      }
-
-      if (dateFilter) {
-        query += " AND posted_date >= ?";
-        params.push(dateFilter.toISOString().slice(0, 19).replace('T', ' ')); // Format for MySQL DATETIME
-      }
-    }
-
-    if (isUrgent === 'true') {
-      query += " AND is_urgent = 1";
-    }
-
-    // Count total jobs for pagination
-    const [totalJobsResult] = await pool.execute(
-      `SELECT COUNT(*) AS total FROM jobs WHERE 1=1${query.substring(query.indexOf('AND'))}`,
-      params
-    );
-    const totalJobs = totalJobsResult[0].total;
-    const totalPages = Math.ceil(totalJobs / limit);
-    const offset = (page - 1) * limit;
-
-    query += " LIMIT ? OFFSET ?";
-    params.push(parseInt(limit), parseInt(offset));
-
-    const [jobs] = await pool.execute(query, params);
+    // Pass all query parameters to the centralized helper function
+    const { jobs, totalJobs, totalPages, currentPage } = await findJobs({ 
+      q, 
+      experienceLevel, 
+      location, 
+      datePosted, 
+      isUrgent, 
+      page, 
+      limit, 
+      minSalary, 
+      maxSalary, 
+      employmentType 
+    });
 
     res.json({
       jobs: jobs,
       pagination: {
-        currentPage: parseInt(page),
+        currentPage: currentPage,
         totalPages: totalPages,
         totalJobs: totalJobs,
-        limit: parseInt(limit),
+        limit: limit, // Use the resolved limit from the helper
       },
     });
   } catch (error) {
@@ -279,8 +237,13 @@ const getJobById = async (req, res) => {
       return res.status(400).json({ error: { code: 400, message: "Job ID is required." } });
     }
 
-    const [jobs] = await pool.execute("SELECT * FROM jobs WHERE id = ?", [id]);
-    const job = jobs[0];
+    const jobId = parseInt(id, 10); // Parse to integer
+    if (isNaN(jobId)) {
+      return res.status(400).json({ error: { code: 400, message: "Invalid Job ID format. Must be a number." } });
+    }
+
+    // Use the helper function to fetch the job
+    const job = await findJobById(jobId); // Use findJobById
 
     if (!job) {
       return res.status(404).json({ error: { code: 404, message: "Job posting not found." } });
@@ -297,34 +260,15 @@ const getJobById = async (req, res) => {
 const getAppliedJobs = async (req, res) => {
   try {
     const { status } = req.query;
-    let query = `
-      SELECT
-        ja.application_id,
-        j.id AS jobId,
-        j.title,
-        j.company,
-        j.location,
-        CONCAT(j.currency, j.min_salary, ' - ', j.currency, j.max_salary) AS salary,
-        j.openings,
-        ja.applied_date AS appliedDate,
-        ja.status AS status,
-        j.eligibility,
-        j.description,
-        j.work_mode,
-        j.type,
-        j.is_urgent AS isUrgent,
-        j.is_new AS isNew
-      FROM job_applications ja
-      JOIN jobs j ON ja.job_id = j.id
-      WHERE ja.jobseeker_id = ?`;
-    const params = [req.user.id];
+    const jobseekerId = req.user.id;
 
-    if (status) {
-      query += " AND ja.status = ?";
-      params.push(status);
+    // Validate status parameter if provided
+    const allowedStatuses = ['Applied', 'Reviewed', 'Interviewed', 'Rejected', 'Hired']; // Define your allowed statuses
+    if (status && !allowedStatuses.includes(status)) {
+      return res.status(400).json({ error: { code: 400, message: `Invalid status parameter. Allowed values are: ${allowedStatuses.join(', ')}.` } });
     }
 
-    const [appliedJobs] = await pool.execute(query, params);
+    const appliedJobs = await findAppliedJobs(jobseekerId, status);
     res.json({ appliedJobs });
   } catch (error) {
     console.error("Error fetching applied jobs:", error);
@@ -340,31 +284,28 @@ const applyJob = async (req, res) => {
   }
 
   try {
+    // Check if the job exists using the helper function
+    const jobExists = await checkJobExists(job_id);
+    if (!jobExists) {
+      return res.status(404).json({ error: { code: 404, message: "Job not found." } });
+    }
+
     // Get the jobseeker's current resume filepath
-    const [jobseekers] = await pool.execute(
-      "SELECT resume_filepath FROM jobseeker WHERE user_id = ?",
-      [req.user.id]
-    );
-    const jobseeker = jobseekers[0];
-    const resume_filepath = jobseeker ? jobseeker.resume_filepath : null;
+    const jobseekerResumePath = await getJobseekerResumePathByUserId(req.user.id);
 
-    // Check if already applied
-    const [existingApplication] = await pool.execute(
-      "SELECT application_id FROM job_applications WHERE job_id = ? AND jobseeker_id = ?",
-      [job_id, req.user.id]
-    );
+    // Optional: Enforce resume requirement for applying
+    if (!jobseekerResumePath) {
+      return res.status(400).json({ error: { code: 400, message: "Please upload your resume before applying for a job." } });
+    }
 
-    if (existingApplication.length > 0) {
+    // Check if already applied using the helper function
+    const alreadyApplied = await findExistingApplication(job_id, req.user.id);
+    if (alreadyApplied) {
       return res.status(409).json({ error: { code: 409, message: "You have already applied for this job." } });
     }
 
-    // Insert new application with resume_filepath and current timestamp
-    const [result] = await pool.execute(
-      "INSERT INTO job_applications (job_id, jobseeker_id, resume_filepath, applied_date, status) VALUES (?, ?, ?, NOW(), ?)",
-      [job_id, req.user.id, resume_filepath, "Applied"]
-    );
-
-    const applicationId = result.insertId;
+    // Insert new application using the helper function
+    const applicationId = await createJobApplication(job_id, req.user.id, jobseekerResumePath, "Applied");
 
     res.status(201).json({
       message: "Job application submitted successfully",
@@ -384,48 +325,17 @@ const applyJob = async (req, res) => {
 const getSchedule = async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
-    let query = `
-      SELECT
-        se.event_id AS id,
-        se.event_type AS type,
-        se.event_title AS title,
-        se.event_datetime AS date,
-        se.event_location AS location,
-        se.event_description AS description,
-        -- Interview specific details
-        i.interview_id,
-        i.interview_type,
-        i.interviewer_id,
-        i.status AS interviewStatus,
-        i.notes AS interviewNotes,
-        -- Job Application details
-        ja.application_id,
-        ja.status AS applicationStatus,
-        -- Job details
-        j.id AS jobId,
-        j.title AS jobTitle,
-        j.company AS companyName
-      FROM scheduled_events se
-      LEFT JOIN interviews i ON se.event_id = i.scheduled_event_id AND se.event_type = 'interview'
-      LEFT JOIN job_applications ja ON i.application_id = ja.application_id
-      LEFT JOIN jobs j ON ja.job_id = j.id
-      WHERE se.user_id = ?
-    `;
-    const params = [req.user.id];
+    const userId = req.user.id;
 
-    if (startDate) {
-      query += ` AND se.event_datetime >= ?`;
-      params.push(startDate);
+    // Validate date parameters if provided
+    if (startDate && !validator.isISO8601(startDate)) {
+      return res.status(400).json({ error: { code: 400, message: "Invalid startDate format. Expected YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ." } });
     }
-    if (endDate) {
-      query += ` AND se.event_datetime <= ?`;
-      params.push(endDate);
+    if (endDate && !validator.isISO8601(endDate)) {
+      return res.status(400).json({ error: { code: 400, message: "Invalid endDate format. Expected YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ." } });
     }
 
-    // Add ordering to the query
-    query += ` ORDER BY se.event_datetime ASC`;
-
-    const [schedules] = await pool.execute(query, params);
+    const schedules = await findScheduleByUserId(userId, startDate, endDate);
 
     // Format the date/time for the frontend if needed, though MySQL datetime should be fine
     const formattedSchedules = schedules.map(schedule => {
@@ -449,35 +359,28 @@ const getSchedule = async (req, res) => {
 const getNotifications = async (req, res) => {
   try {
     const { date, readStatus, type } = req.query;
-    let query = "SELECT * FROM notifications WHERE user_id = ?";
-    const params = [req.user.id];
+    const userId = req.user.id;
 
-    if (date) {
-      query += " AND DATE(created_at) = ?";
-      params.push(date);
-    }
-    if (readStatus !== undefined) {
-      query += " AND is_read = ?";
-      params.push(readStatus === 'true' ? 1 : 0);
-    }
-    if (type) {
-      query += " AND type = ?";
-      params.push(type);
+    // Validate date parameter if provided
+    if (date && !validator.isISO8601(date)) {
+      return res.status(400).json({ error: { code: 400, message: "Invalid date format. Expected YYYY-MM-DD." } });
     }
 
-    const [notifications] = await pool.execute(query, params);
+    // Validate type parameter if provided
+    const allowedNotificationTypes = ['interview', 'application_status', 'announcement', 'system']; // Define your allowed types
+    if (type && !allowedNotificationTypes.includes(type)) {
+      return res.status(400).json({ error: { code: 400, message: `Invalid notification type. Allowed values are: ${allowedNotificationTypes.join(', ')}.` } });
+    }
 
-    // Get unread count separately
-    const [unreadCountResult] = await pool.execute(
-      "SELECT COUNT(*) AS unreadCount FROM notifications WHERE user_id = ? AND is_read = FALSE",
-      [req.user.id]
-    );
-    const unreadCount = unreadCountResult[0].unreadCount;
+    const notifications = await findNotificationsByUserId(userId, date, readStatus, type);
+
+    // Get unread count separately using the helper function
+    const unreadCount = await countUnreadNotifications(userId);
 
     res.json({ notifications: notifications, unreadCount: unreadCount });
   } catch (error) {
     console.error("Error fetching notifications:", error);
-    res.status(500).json({ error: { code: 500, message: "Internal server error" } });
+    res.status(500).json({ error: "Internal server error" });
   }
 };
 
@@ -491,12 +394,9 @@ const markNotificationRead = async (req, res) => {
       return res.status(400).json({ error: { code: 400, message: "'read' status is required and must be a boolean." } });
     }
 
-    const [result] = await pool.execute(
-      "UPDATE notifications SET is_read = ? WHERE notification_id = ? AND user_id = ?",
-      [read ? 1 : 0, id, req.user.id] // Store as 1 or 0 for tinyint
-    );
+    const affectedRows = await updateNotificationReadStatus(id, req.user.id, read); // Use helper function
 
-    if (result.affectedRows === 0) {
+    if (affectedRows === 0) {
       return res.status(404).json({ error: { code: 404, message: "Notification not found or does not belong to user" } });
     }
 
@@ -510,8 +410,9 @@ const markNotificationRead = async (req, res) => {
 // PUT /jobseeker/api/notifications/mark-all-read (Changed from PATCH to PUT)
 const markAllNotificationsRead = async (req, res) => {
   try {
-    await pool.execute("UPDATE notifications SET is_read = TRUE WHERE user_id = ?", [req.user.id]);
-    res.json({ message: `All notifications marked as read for jobseeker '${req.user.id}'.` });
+    const userId = req.user.id;
+    const affectedRows = await markAllNotificationsReadHelper(userId); // Call the renamed helper
+    res.json({ message: `All notifications marked as read for jobseeker '${userId}'.`, affectedRows });
   } catch (error) {
     console.error("Error marking all notifications as read:", error);
     res.status(500).json({ error: { code: 500, message: "Internal server error" } });
@@ -523,12 +424,9 @@ const deleteNotification = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const [result] = await pool.execute(
-      "DELETE FROM notifications WHERE notification_id = ? AND user_id = ?",
-      [id, req.user.id]
-    );
+    const affectedRows = await deleteNotificationById(id, req.user.id); // Use helper function
 
-    if (result.affectedRows === 0) {
+    if (affectedRows === 0) {
       return res.status(404).json({ error: { code: 404, message: "Notification not found or does not belong to user" } });
     }
 
@@ -546,10 +444,7 @@ const getUpcomingNotifications = async (req, res) => {
     const sevenDaysFromNow = new Date();
     sevenDaysFromNow.setDate(sevenDaysFromNow.getDate() + 7);
 
-    const [upcomingNotifications] = await pool.execute(
-      "SELECT * FROM notifications WHERE user_id = ? AND is_read = FALSE AND created_at <= ? ORDER BY created_at ASC",
-      [req.user.id, sevenDaysFromNow.toISOString().slice(0, 19).replace('T', ' ')]
-    );
+    const upcomingNotifications = await findUpcomingNotifications(req.user.id, sevenDaysFromNow); // Use helper function
 
     res.json({ upcomingNotifications: upcomingNotifications });
   } catch (error) {
@@ -574,4 +469,5 @@ module.exports = {
   deleteNotification,
   getUpcomingNotifications,
   upload,
-}; 
+  multerErrorHandler,
+};

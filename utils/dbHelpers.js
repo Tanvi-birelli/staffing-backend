@@ -262,10 +262,19 @@ async function updateJobseekerProfile(userId, profileUpdates) {
     return true; // Indicate success
 }
 
-async function updateJobseekerResumePath(userId, resumePath) {
+async function getJobseekerResumePathByUserId(userId) {
+    const [rows] = await pool.execute(
+        'SELECT resume_filepath FROM jobseeker WHERE user_id = ?',
+        [userId]
+    );
+    return rows.length > 0 ? rows[0].resume_filepath : null;
+}
+
+// Modified to accept and store only the filename
+async function updateJobseekerResumePath(userId, newResumeFilename) {
     await pool.execute(
         'UPDATE jobseeker SET resume_filepath = ? WHERE user_id = ?',
-        [resumePath, userId]
+        [newResumeFilename, userId]
     );
     return true;
 }
@@ -277,6 +286,250 @@ async function findMaxVoatIdSuffix() {
         `SELECT MAX(CAST(SUBSTRING_INDEX(voat_id, '-', -1) AS UNSIGNED)) AS max_suffix FROM users WHERE voat_id LIKE 'VOAT-%'`
     );
     return rows[0].max_suffix || 0; // Return 0 if no VOAT-IDs exist
+}
+
+async function findJobs(queryParams) {
+  let { q, experienceLevel, location, datePosted, isUrgent, page = 1, limit = 10, minSalary, maxSalary, employmentType } = queryParams;
+
+  const MAX_LIMIT = 100;
+  limit = Math.min(parseInt(limit), MAX_LIMIT);
+  page = parseInt(page);
+
+  let baseQuery = "SELECT * FROM jobs WHERE 1=1";
+  let countQuery = "SELECT COUNT(*) AS total FROM jobs WHERE 1=1";
+  const params = [];
+
+  if (q) {
+    const searchTerm = `%${q}%`;
+    baseQuery += " AND (title LIKE ? OR company LIKE ? OR description LIKE ?)";
+    countQuery += " AND (title LIKE ? OR company LIKE ? OR description LIKE ?)";
+    params.push(searchTerm, searchTerm, searchTerm);
+  }
+
+  if (experienceLevel) {
+    baseQuery += " AND experience = ?";
+    countQuery += " AND experience = ?";
+    params.push(experienceLevel);
+  }
+
+  if (location) {
+    baseQuery += " AND location LIKE ?";
+    countQuery += " AND location LIKE ?";
+    params.push(`%${location}%`);
+  }
+
+  if (employmentType) {
+    baseQuery += " AND type = ?";
+    countQuery += " AND type = ?";
+    params.push(employmentType);
+  }
+
+  if (minSalary && maxSalary) {
+    const parsedMinSalary = parseFloat(minSalary);
+    const parsedMaxSalary = parseFloat(maxSalary);
+    if (!isNaN(parsedMinSalary) && !isNaN(parsedMaxSalary)) {
+      baseQuery += " AND min_salary >= ? AND max_salary <= ?";
+      countQuery += " AND min_salary >= ? AND max_salary <= ?";
+      params.push(parsedMinSalary, parsedMaxSalary);
+    }
+  }
+
+  if (datePosted) {
+    const now = new Date();
+    let dateFilter = null;
+    if (datePosted === "last24hours") {
+      dateFilter = new Date(now.setDate(now.getDate() - 1));
+    } else if (datePosted === "last7days") {
+      dateFilter = new Date(now.setDate(now.getDate() - 7));
+    } else if (datePosted === "last30days") {
+      dateFilter = new Date(now.setDate(now.getDate() - 30));
+    }
+    if (dateFilter) {
+      baseQuery += " AND posted_date >= ?";
+      countQuery += " AND posted_date >= ?";
+      params.push(dateFilter.toISOString().slice(0, 19).replace('T', ' '));
+    }
+  }
+
+  if (isUrgent === 'true') {
+    baseQuery += " AND is_urgent = 1";
+    countQuery += " AND is_urgent = 1";
+  }
+
+  const [totalJobsResult] = await pool.execute(countQuery, params);
+  const totalJobs = totalJobsResult[0].total;
+  const totalPages = Math.ceil(totalJobs / limit);
+  const offset = (page - 1) * limit;
+
+  const finalBaseQueryWithPagination = `${baseQuery} LIMIT ${limit} OFFSET ${offset}`;
+  const [jobs] = await pool.execute(finalBaseQueryWithPagination, params);
+
+  return { jobs, totalJobs, totalPages, currentPage: page, limit };
+}
+
+async function findJobById(jobId) {
+  const [jobs] = await pool.execute("SELECT * FROM jobs WHERE id = ?", [jobId]);
+  return jobs[0];
+}
+
+async function findAppliedJobs(jobseekerId, status) {
+  let query = `
+    SELECT
+      ja.application_id,
+      j.id AS jobId,
+      j.title,
+      j.company,
+      j.location,
+      CONCAT(j.currency, j.min_salary, ' - ', j.currency, j.max_salary) AS salary,
+      j.openings,
+      ja.application_date AS appliedDate,
+      ja.status AS status,
+      j.eligibility,
+      j.description,
+      j.work_mode,
+      j.type,
+      j.is_urgent AS isUrgent,
+      j.is_new AS isNew
+    FROM job_applications ja
+    JOIN jobs j ON ja.job_id = j.id
+    WHERE ja.jobseeker_id = ?`;
+  const params = [jobseekerId];
+
+  if (status) {
+    query += " AND ja.status = ?";
+    params.push(status);
+  }
+
+  const [appliedJobs] = await pool.execute(query, params);
+  return appliedJobs;
+}
+
+async function checkJobExists(jobId) {
+  const [jobs] = await pool.execute("SELECT id FROM jobs WHERE id = ?", [jobId]);
+  return jobs.length > 0;
+}
+
+async function findExistingApplication(jobId, jobseekerId) {
+  const [existingApplication] = await pool.execute(
+    "SELECT application_id FROM job_applications WHERE job_id = ? AND jobseeker_id = ?",
+    [jobId, jobseekerId]
+  );
+  return existingApplication.length > 0;
+}
+
+async function createJobApplication(jobId, jobseekerId, resumeFilepath, status) {
+  const [result] = await pool.execute(
+    "INSERT INTO job_applications (job_id, jobseeker_id, resume_filepath, status) VALUES (?, ?, ?, ?)",
+    [jobId, jobseekerId, resumeFilepath, status]
+  );
+  return result.insertId;
+}
+
+async function findScheduleByUserId(userId, startDate, endDate) {
+  let query = `
+    SELECT
+      se.event_id AS id,
+      se.event_type AS type,
+      se.title AS title,
+      se.event_datetime AS date,
+      se.location AS location,
+      se.description AS description,
+      -- Interview specific details
+      i.interview_id,
+      i.interview_type,
+      i.interviewer_id,
+      i.status AS interviewStatus,
+      i.notes AS interviewNotes,
+      -- Job Application details
+      ja.application_id,
+      ja.status AS applicationStatus,
+      -- Job details
+      j.id AS jobId,
+      j.title AS jobTitle,
+      j.company AS companyName
+    FROM scheduled_events se
+    LEFT JOIN interviews i ON se.event_id = i.scheduled_event_id AND se.event_type = 'interview'
+    LEFT JOIN job_applications ja ON i.application_id = ja.application_id
+    LEFT JOIN jobs j ON ja.job_id = j.id
+    WHERE se.user_id = ?
+  `;
+  const params = [userId];
+
+  if (startDate) {
+    query += ` AND se.event_datetime >= ?`;
+    params.push(startDate);
+  }
+  if (endDate) {
+    query += ` AND se.event_datetime <= ?`;
+    params.push(endDate);
+  }
+
+  query += ` ORDER BY se.event_datetime ASC`;
+
+  const [schedules] = await pool.execute(query, params);
+  return schedules;
+}
+
+async function findNotificationsByUserId(userId, date, readStatus, type) {
+  let query = "SELECT * FROM notifications WHERE user_id = ?";
+  const params = [userId];
+
+  if (date) {
+    query += " AND DATE(created_at) = ?";
+    params.push(date);
+  }
+  if (readStatus !== undefined) {
+    query += " AND is_read = ?";
+    params.push(readStatus === 'true' ? 1 : 0);
+  }
+  if (type) {
+    query += " AND type = ?";
+    params.push(type);
+  }
+
+  const [notifications] = await pool.execute(query, params);
+  return notifications;
+}
+
+async function countUnreadNotifications(userId) {
+  const [unreadCountResult] = await pool.execute(
+    "SELECT COUNT(*) AS unreadCount FROM notifications WHERE user_id = ? AND is_read = FALSE",
+    [userId]
+  );
+  return unreadCountResult[0].unreadCount;
+}
+
+async function updateNotificationReadStatus(notificationId, userId, readStatus) {
+  const [result] = await pool.execute(
+    "UPDATE notifications SET is_read = ? WHERE notification_id = ? AND user_id = ?",
+    [readStatus ? 1 : 0, notificationId, userId]
+  );
+  return result.affectedRows;
+}
+
+async function markAllNotificationsRead(userId) {
+  const [result] = await pool.execute("UPDATE notifications SET is_read = TRUE WHERE user_id = ?", [userId]);
+  return result.affectedRows; // Return affected rows for confirmation
+}
+
+async function deleteNotificationById(notificationId, userId) {
+  const [result] = await pool.execute(
+    "DELETE FROM notifications WHERE notification_id = ? AND user_id = ?",
+    [notificationId, userId]
+  );
+  return result.affectedRows;
+}
+
+async function findUpcomingNotifications(userId) {
+  const today = new Date();
+  const sevenDaysFromNow = new Date();
+  sevenDaysFromNow.setDate(sevenDaysFromNow.getDate() + 7);
+
+  const [upcomingNotifications] = await pool.execute(
+    "SELECT * FROM notifications WHERE user_id = ? AND is_read = FALSE AND DATE(created_at) >= DATE(?) AND DATE(created_at) <= DATE(?) ORDER BY created_at ASC",
+    [userId, today.toISOString().slice(0, 10), sevenDaysFromNow.toISOString().slice(0, 10)]
+  );
+  return upcomingNotifications;
 }
 
 module.exports = {
@@ -299,5 +552,19 @@ module.exports = {
     findJobseekerProfileByUserId,
     updateJobseekerProfile,
     updateJobseekerResumePath,
-    findMaxVoatIdSuffix
+    getJobseekerResumePathByUserId,
+    findMaxVoatIdSuffix,
+    findJobs,
+    findJobById,
+    findAppliedJobs,
+    checkJobExists,
+    findExistingApplication,
+    createJobApplication,
+    findScheduleByUserId,
+    findNotificationsByUserId,
+    countUnreadNotifications,
+    updateNotificationReadStatus,
+    markAllNotificationsRead,
+    deleteNotificationById,
+    findUpcomingNotifications
 }; 

@@ -1,6 +1,6 @@
 const { pool } = require("../config/db");
 const validator = require("validator");
-const { findUserByEmail, updateUser } = require("../utils/dbHelpers");
+const { findUserByEmail, updateUser, findJobseekerProfileByUserId } = require("../utils/dbHelpers");
 
 // HR Profile Management Controllers
 const getProfile = async (req, res) => {
@@ -230,6 +230,214 @@ const scheduleInterview = async (req, res) => {
   }
 };
 
+// HR Job Management Controllers
+const createJob = async (req, res) => {
+  try {
+    const { title, description, requirements, location, salary_range, employment_type } = req.body;
+    const hr_id = req.user.id;
+
+    if (!title || !description || !requirements || !location || !employment_type) {
+      return res.status(400).json({ error: "Missing required job details" });
+    }
+
+    const [result] = await pool.execute(
+      `INSERT INTO jobs (title, description, requirements, location, salary_range, employment_type, posted_by_user_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [title, description, requirements, location, salary_range || null, employment_type, hr_id]
+    );
+
+    res.status(201).json({ message: "Job created successfully", jobId: result.insertId });
+  } catch (error) {
+    console.error("Error creating job:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+const getAllJobs = async (req, res) => {
+  try {
+    const [jobs] = await pool.execute("SELECT * FROM jobs WHERE posted_by_user_id = ?", [req.user.id]);
+    res.json(jobs);
+  } catch (error) {
+    console.error("Error fetching jobs:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+const getJobById = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const [jobs] = await pool.execute("SELECT * FROM jobs WHERE id = ? AND posted_by_user_id = ?", [jobId, req.user.id]);
+
+    const job = jobs[0];
+    if (!job) {
+      return res.status(404).json({ error: "Job not found or you don't have permission to view it" });
+    }
+    res.json(job);
+  } catch (error) {
+    console.error("Error fetching job by ID:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+const updateJob = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { title, description, requirements, location, salary_range, employment_type } = req.body;
+    const hr_id = req.user.id;
+
+    const [existingJob] = await pool.execute("SELECT id FROM jobs WHERE id = ? AND posted_by_user_id = ?", [jobId, hr_id]);
+    if (existingJob.length === 0) {
+      return res.status(404).json({ error: "Job not found or you don't have permission to update it" });
+    }
+
+    const updates = {};
+    if (title !== undefined) updates.title = title;
+    if (description !== undefined) updates.description = description;
+    if (requirements !== undefined) updates.requirements = requirements;
+    if (location !== undefined) updates.location = location;
+    if (salary_range !== undefined) updates.salary_range = salary_range;
+    if (employment_type !== undefined) updates.employment_type = employment_type;
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: "No updates provided" });
+    }
+
+    const setClause = Object.keys(updates).map(key => `\`${key}\` = ?`).join(', ');
+    const values = [...Object.values(updates), jobId, hr_id];
+
+    await pool.execute(
+      `UPDATE jobs SET ${setClause} WHERE id = ? AND posted_by_user_id = ?`,
+      values
+    );
+
+    res.json({ message: "Job updated successfully" });
+  } catch (error) {
+    console.error("Error updating job:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+const deleteJob = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const hr_id = req.user.id;
+
+    const [result] = await pool.execute("DELETE FROM jobs WHERE id = ? AND posted_by_user_id = ?", [jobId, hr_id]);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Job not found or you don't have permission to delete it" });
+    }
+
+    res.json({ message: "Job deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting job:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+// HR Job Application Management
+const getAllApplications = async (req, res) => {
+  try {
+    const [applications] = await pool.execute(
+      `SELECT ja.*, j.title as job_title, u.username as jobseeker_username, u.email as jobseeker_email
+       FROM job_applications ja
+       JOIN jobs j ON ja.job_id = j.id
+       JOIN users u ON ja.jobseeker_id = u.id
+       WHERE j.posted_by_user_id = ?`,
+      [req.user.id]
+    );
+    res.json(applications);
+  } catch (error) {
+    console.error("Error fetching all applications:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+const getApplicationById = async (req, res) => {
+  try {
+    const { applicationId } = req.params;
+    const [applications] = await pool.execute(
+      `SELECT ja.*, j.title as job_title, u.username as jobseeker_username, u.email as jobseeker_email
+       FROM job_applications ja
+       JOIN jobs j ON ja.job_id = j.id
+       JOIN users u ON ja.jobseeker_id = u.id
+       WHERE ja.application_id = ? AND j.posted_by_user_id = ?`,
+      [applicationId, req.user.id]
+    );
+
+    const application = applications[0];
+    if (!application) {
+      return res.status(404).json({ error: "Application not found or you don't have permission to view it" });
+    }
+    res.json(application);
+  } catch (error) {
+    console.error("Error fetching application by ID:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+const updateApplicationStatus = async (req, res) => {
+  try {
+    const { applicationId } = req.params;
+    const { status, feedback } = req.body;
+
+    if (!status) {
+      return res.status(400).json({ error: "Missing required status" });
+    }
+
+    const [existingApplication] = await pool.execute(
+      `SELECT ja.application_id, j.posted_by_user_id 
+       FROM job_applications ja
+       JOIN jobs j ON ja.job_id = j.id
+       WHERE ja.application_id = ? AND j.posted_by_user_id = ?`,
+      [applicationId, req.user.id]
+    );
+
+    if (existingApplication.length === 0) {
+      return res.status(404).json({ error: "Application not found or you don't have permission to update it" });
+    }
+
+    const updates = { status };
+    if (feedback !== undefined) {
+      updates.feedback = feedback;
+    }
+
+    const setClause = Object.keys(updates).map(key => `\`${key}\` = ?`).join(', ');
+    const values = [...Object.values(updates), applicationId];
+
+    await pool.execute(
+      `UPDATE job_applications SET ${setClause} WHERE application_id = ?`,
+      values
+    );
+
+    // Potentially send a notification to the jobseeker about the status change
+    // This can be implemented here or as a separate utility/event.
+
+    res.json({ message: "Application status updated successfully" });
+  } catch (error) {
+    console.error("Error updating application status:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+// HR Jobseeker Profile Viewing
+const getJobseekerProfile = async (req, res) => {
+  try {
+    const { jobseekerId } = req.params;
+    const profile = await findJobseekerProfileByUserId(jobseekerId);
+
+    if (!profile) {
+      return res.status(404).json({ error: "Jobseeker profile not found." });
+    }
+    // Ensure HR can only view profiles related to jobs they manage or for applications they are processing
+    // For now, assuming HR can view any jobseeker profile for simplicity, but this can be refined later.
+    res.json(profile);
+  } catch (error) {
+    console.error("Error fetching jobseeker profile for HR:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
 module.exports = {
   getProfile,
   updateProfile,
@@ -238,4 +446,13 @@ module.exports = {
   markNotificationRead,
   markAllNotificationsRead,
   scheduleInterview,
+  createJob,
+  getAllJobs,
+  getJobById,
+  updateJob,
+  deleteJob,
+  getAllApplications,
+  getApplicationById,
+  updateApplicationStatus,
+  getJobseekerProfile,
 }; 

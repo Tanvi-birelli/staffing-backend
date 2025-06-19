@@ -21,7 +21,7 @@ const signup = async (req, res) => {
   //console.log("password:", password);
   //console.log("role:", role);
   //console.log("file:", file);
-  
+
   if (!name || name.trim() === "") {
     return res.status(400).json({ error: "Invalid name" });
   }
@@ -59,6 +59,7 @@ const signup = async (req, res) => {
     if (pendingSignup.blockExpires && pendingSignup.blockExpires > now) {
       const remainingMillis = pendingSignup.blockExpires - now;
       const remainingMinutes = Math.ceil(remainingMillis / (60 * 1000));
+      
       return res.status(429).json({ error: `Too many signup attempts. Please try again in ${remainingMinutes} minute(s).` });
     }
 
@@ -349,7 +350,7 @@ const verifyOTP = async (req, res) => {
         hashedPassword: pendingSignup.hashedPassword,
         role: pendingSignup.role,
         voatId: voatId,
-        verified: true,
+      verified: true,
         resume_filepath: pendingSignup.resume_filepath
       });
 
